@@ -437,31 +437,54 @@ class SearchSkill:
         环境变量: SEARCH_V_PATH
 
         API: search-v.py 暴露 search_bing(query, limit) -> (results, error)
+
+        V 2026-06-04 重构: 加 mod cache（避免每次 reload） + 精准异常
         """
+        # 顶层导入（不在函数体里）
         import importlib.util
-        import os as _os
+        import os
 
         search_v_path = self.config.search_v_path
-        if not search_v_path or not _os.path.exists(search_v_path):
+        if not search_v_path or not os.path.exists(search_v_path):
             raise SearchAPIError(
                 engine="bing",
                 message=f"search_v_path not set or file missing: {search_v_path}",
             )
 
+        # Cache 加载的 module（key = 绝对路径，避免同一 skill 多次 reload）
+        cache_key = os.path.abspath(search_v_path)
+        if not hasattr(self, "_v_search_v_cache"):
+            self._v_search_v_cache = {}
+        mod = self._v_search_v_cache.get(cache_key)
+        if mod is None:
+            try:
+                spec = importlib.util.spec_from_file_location("v_search_v", search_v_path)
+                if spec is None or spec.loader is None:
+                    raise SearchAPIError(
+                        engine="bing",
+                        message=f"importlib spec failed for {search_v_path}",
+                    )
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)  # type: ignore
+                self._v_search_v_cache[cache_key] = mod
+            except SearchAPIError:
+                raise
+            except (ImportError, SyntaxError, AttributeError) as e:
+                # 精准异常（不抓 KeyboardInterrupt/SystemExit/其他）
+                raise SearchAPIError(
+                    engine="bing",
+                    message=f"importlib load failed: {type(e).__name__}: {e}",
+                )
+
         try:
-            spec = importlib.util.spec_from_file_location("v_search_v", search_v_path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)  # type: ignore
             raw_results, err = mod.search_bing(query, limit=max_results)
-            if err:
-                raise SearchAPIError(engine="bing", message=err)
-        except SearchAPIError:
-            raise
-        except Exception as e:
+        except AttributeError as e:
             raise SearchAPIError(
                 engine="bing",
-                message=f"importlib load failed: {e}",
+                message=f"search_bing() missing in {search_v_path}: {e}",
             )
+        if err:
+            raise SearchAPIError(engine="bing", message=err)
 
         results: list[SearchResult] = []
         for item in raw_results[:max_results]:
