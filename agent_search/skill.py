@@ -18,10 +18,27 @@ from typing import Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
-from agent_symphony.shared import (
-    SharedContext,
-    get_context,
-)
+# V 2026-06-04: agent_symphony 依赖改为可选，未装时用 mock fallback
+# 这样 pip install -e . 可以独立装包（不用先装 AgentSymphony）
+try:
+    from agent_symphony.shared import (
+        SharedContext,
+        get_context,
+    )
+    _HAS_AGENT_SYMPHONY = True
+except ImportError:
+    # 没装 AgentSymphony 时，SharedContext 用本地 mock
+    class SharedContext:  # type: ignore[no-redef]
+        """Mock SharedContext（agent_symphony 未装时使用）"""
+        def get_caller(self):
+            class _Caller:
+                caller_id = "v-mock"
+            return _Caller()
+        def set_search_query(self, q): pass
+        def set_search_results(self, r): pass
+    def get_context() -> SharedContext:  # type: ignore[no-redef]
+        return SharedContext()
+    _HAS_AGENT_SYMPHONY = False
 
 
 class SearchEngine(Enum):
@@ -32,6 +49,7 @@ class SearchEngine(Enum):
     FIRECRAWL = "firecrawl"
     PERPLEXITY = "perplexity"
     MOCK = "mock"
+    BING = "bing"  # V 端 search-v.py 集成（2026-06-04 V 加）
 
 
 @dataclass
@@ -61,7 +79,9 @@ class SearchConfig:
     # API 配置
     tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
     brave_api_key: str = field(default_factory=lambda: os.getenv("BRAVE_API_KEY", ""))
-    
+    # V 端 search-v.py 路径（Bing 引擎需要，可选）
+    search_v_path: str = field(default_factory=lambda: os.getenv("SEARCH_V_PATH", ""))
+
     # 过滤器配置
     min_content_length: int = 100
     max_content_length: int = 10000
@@ -223,7 +243,10 @@ class SearchSkill:
                 elif engine == "brave" and self.config.brave_api_key:
                     results = self._search_brave(query, max_results)
                     used_engines.append("brave")
-                elif engine in ("tavily", "brave", "exa", "perplexity"):
+                elif engine == "bing" and self.config.search_v_path:
+                    results = self._search_bing(query, max_results)
+                    used_engines.append("bing")
+                elif engine in ("tavily", "brave", "exa", "perplexity", "bing"):
                     # API 未配置时跳过
                     continue
                 else:
@@ -398,7 +421,61 @@ class SearchSkill:
                 freshness=age,
                 authority=0.5  # Brave 不提供权威性评分
             ))
-        
+
+        return results
+
+    # ==================== Bing (V 端 search-v.py 集成) ====================
+
+    def _search_bing(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        """
+        使用 V 端 search-v.py (Bing HTML) 搜索
+
+        集成方式: importlib 动态加载（不污染 sys.path）
+        依赖: httpx + lxml（在 search-v.py 里；Bing 引擎需 pip install agent-search[bing]）
+
+        配置: SearchConfig.search_v_path = "/path/to/search-v.py"
+        环境变量: SEARCH_V_PATH
+
+        API: search-v.py 暴露 search_bing(query, limit) -> (results, error)
+        """
+        import importlib.util
+        import os as _os
+
+        search_v_path = self.config.search_v_path
+        if not search_v_path or not _os.path.exists(search_v_path):
+            raise SearchAPIError(
+                engine="bing",
+                message=f"search_v_path not set or file missing: {search_v_path}",
+            )
+
+        try:
+            spec = importlib.util.spec_from_file_location("v_search_v", search_v_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore
+            raw_results, err = mod.search_bing(query, limit=max_results)
+            if err:
+                raise SearchAPIError(engine="bing", message=err)
+        except SearchAPIError:
+            raise
+        except Exception as e:
+            raise SearchAPIError(
+                engine="bing",
+                message=f"importlib load failed: {e}",
+            )
+
+        results: list[SearchResult] = []
+        for item in raw_results[:max_results]:
+            results.append(SearchResult(
+                url=item.get("url", ""),
+                title=item.get("title", ""),
+                content=item.get("content", ""),
+                engine="bing",
+                score=0.0,  # Bing HTML 不直接提供分数
+                relevance=0.6,  # 中等默认（无评分）
+                freshness="",  # search-v.py 不解析日期
+                authority=0.5,  # 中等默认
+            ))
+
         return results
 
     # ==================== Mock 实现（备选） ====================

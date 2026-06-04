@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-search"
+version = "1.0.0"
+description = "多引擎搜索技能 - Tavily / Brave / Exa / Firecrawl / Perplexity / Bing"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "V Team", email = "v@example.com"}
+]
+keywords = ["search", "agent", "multi-engine", "tavily", "brave", "bing"]
+
+# 核心依赖（必需）
+dependencies = [
+    # 暂无核心外部依赖（用 stdlib urllib）
+]
+
+# 可选依赖（启用对应引擎时安装）
+[project.optional-dependencies]
+# Tavily / Brave / Exa / Firecrawl / Perplexity 暂无 pip 包（用 urllib 直调 HTTP）
+# Bing 引擎需要 httpx + lxml（来自 V 端 search-v.py）
+bing = [
+    "httpx>=0.24.0",
+    "lxml>=4.9.0",
+]
+# AgentSymphony 集成（如装在 AgentSymphony 仓里）
+symphony = [
+    "agent-symphony>=0.1.0",
+]
+# AgentTeam 集成
+team = [
+    "agentteam>=0.7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/YintaTriss/AgentSearch"
+Repository = "https://github.com/YintaTriss/AgentSearch"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent_search*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+agent_search = ["SKILL.md"]
