@@ -23,6 +23,7 @@ import time
 import logging
 from pathlib import Path
 from typing import Any, Optional
+from .skill_base import SkillBase
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
@@ -56,7 +57,7 @@ class AgentProfile:
 
 # ==================== AgentRegistry ====================
 
-class AgentRegistry:
+class AgentRegistry(SkillBase):
     """Agent 注册表（内存缓存 + JSON 持久化）"""
 
     def __init__(self, map_file: Optional[Path] = None):
@@ -65,6 +66,14 @@ class AgentRegistry:
         # 确保目录存在
         self.map_file.parent.mkdir(parents=True, exist_ok=True)
 
+        super().__init__(map_file)
+
+    # V 21:52 SkillBase delegation (V 反思 SOP 第 10 件加强版: util 化)
+    def _handle_query(self, capability: str, context: dict) -> dict:
+        return self.query(capability, context)
+
+    def _handle_execute(self, action: str, params: dict) -> dict:
+        return self.execute(action, params)
     def register(self, alias: str, profile: AgentProfile) -> dict:
         """注册 Agent，返回注册结果"""
         if not isinstance(profile, AgentProfile):

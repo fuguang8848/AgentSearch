@@ -16,6 +16,7 @@ import time
 import uuid
 import logging
 from typing import Any, Optional, Callable, Awaitable
+from .skill_base import SkillBase
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict
@@ -72,7 +73,7 @@ class Workflow:
     status: TaskStatus = TaskStatus.PENDING
 
 
-class SupervisorSkill:
+class SupervisorSkill(SkillBase):
     """
     AgentSupervisor 技能
     
@@ -98,6 +99,7 @@ class SupervisorSkill:
 
     # ==================== 标准 Skill 接口 ====================
 
+        super().__init__(config)
     def query(self, capability: str, context: dict | None = None) -> dict:
         """
         查询技能能力
@@ -220,6 +222,13 @@ class SupervisorSkill:
                         handler(data)
                 except Exception as e:
                     logger.error(f"事件处理器错误: {e}")
+
+    # V 21:52 SkillBase delegation (V 反思 SOP 第 10 件加强版: util 化)
+    def _handle_query(self, capability: str, context: dict) -> dict:
+        return self.query(capability, context)
+
+    def _handle_execute(self, action: str, params: dict) -> dict:
+        return self.execute(action, params)
 
     def register_skill(self, name: str, skill: Any):
         """注册其他技能以便调用"""

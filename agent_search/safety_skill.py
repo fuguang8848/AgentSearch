@@ -7,8 +7,20 @@ safety_skill.py - AgentSafety 技能
 3. 内容分类（风险内容识别）
 4. 工具调用安全（参数检查）
 5. 审计日志（安全事件记录）
+6. 熔断保护（Circuit Breaker）
+7. 权限隔离（Permission Scope）
 
-参考 VCP 的分层检测 + AgentSymphony 标准 skill 接口
+参考：
+  - VCP 的分层检测
+  - AgentSymphony 标准 skill 接口
+  - AgentMemory security/circuit_breaker.py（可选集成）
+  - SpectrAI SSH_MANAGER_ENV_PLUGIN_ALLOWLIST 模型
+
+设计原则（可修改性 · 可移植性 · 便于他人开发）：
+  - 所有配置通过 SafetyConfig dataclass 注入，不硬编码
+  - CircuitBreaker 和 PermissionChecker 均为独立可替换组件
+  - 错误处理 graceful，集成失败不影响核心检测功能
+  - 每个危险操作独立可审计
 """
 
 import json
@@ -16,13 +28,209 @@ import re
 import time
 import uuid
 import os
+import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+from .skill_base import SkillBase
 from dataclasses import dataclass, field
 from enum import Enum
 
 
-# ── 常量 ────────────────────────────────────────────────────────────────────
+# ── 日志 ────────────────────────────────────────────────────────────────────
+
+logger = logging.getLogger(__name__)
+
+# ── 熔断器（Circuit Breaker）─────────────────────────────────────────────────
+
+class CircuitState(Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass
+class CircuitBreaker:
+    """轻量级熔断器（不依赖 AgentMemory，独立实现）。
+
+    设计原则：独立、无依赖、可替换。
+    如需使用 AgentMemory 的完整实现，替换此类的实例即可。
+
+    使用示例：
+        breaker = CircuitBreaker(name="safety_check", failure_threshold=5)
+        with breaker:
+            result = do_safety_check()
+    """
+    name: str
+    failure_threshold: int = 5
+    timeout_seconds: float = 30.0
+    _state: CircuitState = field(default=CircuitState.CLOSED, repr=False)
+    _failure_count: int = field(default=0, repr=False)
+    _last_failure_time: float = field(default=0.0, repr=False)
+
+    def __enter__(self):
+        self._check()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            self._record_failure()
+        else:
+            self._record_success()
+        return False
+
+    def _check(self):
+        if self._state == CircuitState.CLOSED:
+            return
+        if self._state == CircuitState.OPEN:
+            if time.time() - self._last_failure_time >= self.timeout_seconds:
+                self._state = CircuitState.HALF_OPEN
+                logger.warning(f"[CircuitBreaker] {self.name} → HALF_OPEN")
+            else:
+                raise RuntimeError(
+                    f"Circuit '{self.name}' is OPEN. "
+                    f"Retry in {self.timeout_seconds - (time.time() - self._last_failure_time):.1f}s"
+                )
+
+    def _record_failure(self):
+        self._failure_count += 1
+        self._last_failure_time = time.time()
+        if self._state == CircuitState.HALF_OPEN:
+            self._state = CircuitState.OPEN
+            logger.warning(f"[CircuitBreaker] {self.name} HALF_OPEN→OPEN (failure)")
+        elif self._failure_count >= self.failure_threshold:
+            self._state = CircuitState.OPEN
+            logger.warning(f"[CircuitBreaker] {self.name} CLOSED→OPEN (threshold reached)")
+
+    def _record_success(self):
+        if self._state == CircuitState.HALF_OPEN:
+            self._state = CircuitState.CLOSED
+            self._failure_count = 0
+            logger.warning(f"[CircuitBreaker] {self.name} HALF_OPEN→CLOSED (recovered)")
+        elif self._state == CircuitState.CLOSED:
+            self._failure_count = max(0, self._failure_count - 1)
+
+    @property
+    def state(self) -> CircuitState:
+        return self._state
+
+    def stats(self) -> dict:
+        return {
+            "name": self.name,
+            "state": self._state.value,
+            "failure_count": self._failure_count,
+            "last_failure": self._last_failure_time,
+        }
+
+
+# ── 权限隔离（Permission Scope）──────────────────────────────────────────────
+
+@dataclass
+class PermissionScope:
+    """权限作用域模型。
+
+    参考 SpectrAI 的 SSH_MANAGER_ENV_PLUGIN_ALLOWLIST 模式：
+    - 白名单：显式允许的操作
+    - 黑名单：显式禁止的操作
+    - 危险插件列表：高危操作需单独确认
+
+    设计原则：权限模型与执行引擎分离，便于审计和扩展。
+    """
+    allowed_plugins: list[str] = field(default_factory=list)
+    denied_plugins: list[str] = field(default_factory=list)
+    dangerous_plugins: list[str] = field(default_factory=list)
+    allow_file_read: bool = True
+    allow_file_write: bool = True
+    allow_network: bool = True
+    allow_shell: bool = False
+    max_file_size_bytes: int = 10 * 1024 * 1024  # 10MB
+
+    def is_plugin_allowed(self, plugin_name: str) -> tuple[bool, str]:
+        """检查插件是否允许执行。返回 (allowed, reason)。"""
+        if plugin_name in self.denied_plugins:
+            return False, f"plugin '{plugin_name}' is explicitly denied"
+
+        if plugin_name in self.dangerous_plugins:
+            return False, f"plugin '{plugin_name}' is marked as dangerous and requires explicit allow"
+
+        if self.allowed_plugins and plugin_name not in self.allowed_plugins:
+            return False, f"plugin '{plugin_name}' not in allowlist"
+
+        return True, "allowed"
+
+    def is_action_allowed(self, action: str, **kwargs) -> tuple[bool, str]:
+        """检查操作是否允许。"""
+        if action in ("file_read", "file_write") and not kwargs.get("check_only", False):
+            if action == "file_read" and not self.allow_file_read:
+                return False, "file read is disabled"
+            if action == "file_write" and not self.allow_file_write:
+                return False, "file write is disabled"
+            size = kwargs.get("size_bytes", 0)
+            if size > self.max_file_size_bytes:
+                return False, f"file size {size} exceeds limit {self.max_file_size_bytes}"
+
+        if action == "shell" and not self.allow_shell:
+            return False, "shell execution is disabled"
+
+        if action == "network" and not self.allow_network:
+            return False, "network access is disabled"
+
+        return True, "allowed"
+
+    def audit_denied(self, plugin_name: str, reason: str):
+        """记录权限拒绝事件。"""
+        logger.warning(f"[PermissionScope] DENIED {plugin_name}: {reason}")
+
+
+class PermissionChecker:
+    """权限检查器。
+
+    独立可替换组件。默认使用 PermissionScope 白名单模型。
+    第三方可通过继承或替换实例来定制权限策略。
+
+    使用示例：
+        checker = PermissionChecker(default_scope)
+        ok, reason = checker.check("SomePlugin", scope=editor_scope)
+    """
+    def __init__(self, default_scope: PermissionScope | None = None):
+        self._default_scope = default_scope or PermissionScope()
+        self._plugin_scopes: dict[str, PermissionScope] = {}
+
+    def register_scope(self, plugin_name: str, scope: PermissionScope):
+        """为特定插件注册独立权限范围。"""
+        self._plugin_scopes[plugin_name] = scope
+
+    def check_plugin(self, plugin_name: str, scope: PermissionScope | None = None) -> tuple[bool, str]:
+        """检查插件是否允许执行。"""
+        effective_scope = self._plugin_scopes.get(plugin_name, scope or self._default_scope)
+        allowed, reason = effective_scope.is_plugin_allowed(plugin_name)
+        if not allowed:
+            effective_scope.audit_denied(plugin_name, reason)
+        return allowed, reason
+
+    def check_action(
+        self,
+        action: str,
+        scope: PermissionScope | None = None,
+        **kwargs
+    ) -> tuple[bool, str]:
+        """检查操作是否允许。"""
+        effective_scope = scope or self._default_scope
+        return effective_scope.is_action_allowed(action, **kwargs)
+
+    def summary(self) -> dict:
+        """返回权限配置摘要（用于审计）。"""
+        return {
+            "default_scope": {
+                "allow_shell": self._default_scope.allow_shell,
+                "allow_network": self._default_scope.allow_network,
+                "dangerous_plugins": self._default_scope.dangerous_plugins,
+                "allowed_plugins": self._default_scope.allowed_plugins,
+            },
+            "custom_plugin_scopes": list(self._plugin_scopes.keys()),
+        }
+
+
+# ── 配置 ────────────────────────────────────────────────────────────────────
 
 AUDIT_DIR = Path.home() / ".agent-search"
 AUDIT_FILE = AUDIT_DIR / "safety_audit.jsonl"
@@ -41,7 +249,11 @@ class RiskLevel(Enum):
 
 @dataclass
 class SafetyConfig:
-    """安全技能配置"""
+    """安全技能配置（所有项均可通过构造函数或配置字典覆盖）。
+
+    设计原则：不硬编码任何可配置项。
+    第三方可通过继承或传入自定义 SafetyConfig 来扩展。
+    """
     # Prompt injection 阈值
     injection_threshold: float = 0.5
 
@@ -54,6 +266,24 @@ class SafetyConfig:
     # 审计日志开关
     enable_audit: bool = True
 
+    # ── 熔断配置 ────────────────────────────────────────────────────────────
+    enable_circuit_breaker: bool = True
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_timeout: float = 30.0
+
+    # ── 权限隔离配置 ───────────────────────────────────────────────────────
+    enable_permission_check: bool = True
+    default_allow_shell: bool = False          # 默认禁止 shell，危险操作需显式开启
+    default_allow_network: bool = True
+    default_allow_file_write: bool = True
+    dangerous_plugins: list[str] = field(default_factory=lambda: [
+        "LinuxShellExecutor",
+        "SSHManager",
+        "RawCommandExecutor",
+    ])
+    allowed_plugins: list[str] = field(default_factory=list)  # 空=全部允许（非危险插件）
+
+    # ── 风险检测配置 ────────────────────────────────────────────────────────
     # 风险关键词（可扩展）
     risk_keywords: list = field(default_factory=lambda: [
         "ignore previous",
@@ -91,7 +321,7 @@ class SafetyConfig:
 
 # ── 核心类 ──────────────────────────────────────────────────────────────────
 
-class SafetySkill:
+class SafetySkill(SkillBase):
     """
     AgentSafety 技能 - 守护 AI 安全
 
@@ -102,8 +332,31 @@ class SafetySkill:
     """
 
     def __init__(self, config: SafetyConfig | None = None):
+        super().__init__(config)
         self.config = config or SafetyConfig()
         self._audit_enabled = self.config.enable_audit
+
+        # ── 熔断器初始化 ───────────────────────────────────────────────────
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
+        if self.config.enable_circuit_breaker:
+            for name in ("check_input", "check_output", "classify", "check_tool"):
+                self._circuit_breakers[name] = CircuitBreaker(
+                    name=f"safety_{name}",
+                    failure_threshold=self.config.circuit_breaker_threshold,
+                    timeout_seconds=self.config.circuit_breaker_timeout,
+                )
+
+        # ── 权限检查器初始化 ──────────────────────────────────────────────
+        self._permission_checker: Optional[PermissionChecker] = None
+        if self.config.enable_permission_check:
+            default_scope = PermissionScope(
+                allow_shell=self.config.default_allow_shell,
+                allow_network=self.config.default_allow_network,
+                allow_file_write=self.config.default_allow_file_write,
+                dangerous_plugins=self.config.dangerous_plugins,
+                allowed_plugins=self.config.allowed_plugins,
+            )
+            self._permission_checker = PermissionChecker(default_scope)
 
     # ==================== 标准接口 ====================
 
@@ -116,6 +369,8 @@ class SafetySkill:
             "safety.classify": lambda ctx: self.classify_content(ctx.get("text", "")),
             "safety.check_tool": lambda ctx: self.check_tool_params(ctx.get("tool_name", ""), ctx.get("params", {})),
             "safety.audit": lambda ctx: self.audit_log(ctx.get("event", ""), ctx.get("data")),
+            "safety.check_permission": lambda ctx: self._check_permission(ctx.get("plugin_name", "")),
+            "safety.circuit_breaker_stats": lambda ctx: self._circuit_breaker_stats(),
         }
         if capability not in capability_map:
             return {
@@ -164,6 +419,13 @@ class SafetySkill:
         pass
 
     # ==================== 输入安全 ====================
+
+    # V 21:52 SkillBase delegation (V 反思 SOP 第 10 件加强版: util 化)
+    def _handle_query(self, capability: str, context: dict) -> dict:
+        return self.query(capability, context)
+
+    def _handle_execute(self, action: str, params: dict) -> dict:
+        return self.execute(action, params)
 
     def check_input(self, text: str) -> dict:
         """
@@ -498,6 +760,29 @@ class SafetySkill:
             record["error"] = str(e)
 
         return {"recorded": recorded, "record": record}
+
+    # ==================== 权限与熔断接口 ====================
+
+    def _check_permission(self, plugin_name: str) -> dict:
+        """检查插件权限。"""
+        if not self._permission_checker:
+            return {"checked": False, "reason": "permission check disabled"}
+        allowed, reason = self._permission_checker.check_plugin(plugin_name)
+        return {
+            "checked": True,
+            "plugin": plugin_name,
+            "allowed": allowed,
+            "reason": reason,
+        }
+
+    def _circuit_breaker_stats(self) -> dict:
+        """返回所有熔断器状态。"""
+        if not self._circuit_breakers:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "breakers": {name: cb.stats() for name, cb in self._circuit_breakers.items()},
+        }
 
     # ==================== 辅助方法 ====================
 
