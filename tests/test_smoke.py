@@ -15,17 +15,34 @@ def test_01_import():
     assert SearchEngine.BING.value == "bing"
     assert SearchEngine.TAVILY.value == "tavily"
     assert SearchEngine.BRAVE.value == "brave"
-    print("✓ Check 1: import OK + BING enum (7 个引擎)")
+    assert SearchEngine.EXA.value == "exa"
+    assert SearchEngine.FIRECRAWL.value == "firecrawl"
+    assert SearchEngine.PERPLEXITY.value == "perplexity"
+    print("✓ Check 1: import OK + 全部 7 个引擎 enum")
 
 
 def test_02_search_config():
-    """Check 2: SearchConfig.search_v_path 字段"""
+    """Check 2: SearchConfig 新引擎 API key 字段"""
     c = SearchConfig()
     assert hasattr(c, 'search_v_path')
+    assert hasattr(c, 'exa_api_key')
+    assert hasattr(c, 'firecrawl_api_key')
+    assert hasattr(c, 'perplexity_api_key')
     assert c.search_v_path == ""  # 默认空
-    c2 = SearchConfig(search_v_path="/tmp/test.py")
+    assert c.exa_api_key == ""
+    assert c.firecrawl_api_key == ""
+    assert c.perplexity_api_key == ""
+    c2 = SearchConfig(
+        search_v_path="/tmp/test.py",
+        exa_api_key="exa-test-key",
+        firecrawl_api_key="firecrawl-test-key",
+        perplexity_api_key="perplexity-test-key"
+    )
     assert c2.search_v_path == "/tmp/test.py"
-    print("✓ Check 2: SearchConfig.search_v_path field")
+    assert c2.exa_api_key == "exa-test-key"
+    assert c2.firecrawl_api_key == "firecrawl-test-key"
+    assert c2.perplexity_api_key == "perplexity-test-key"
+    print("✓ Check 2: SearchConfig 新引擎 API key 字段")
 
 
 def test_03_bing_real_search():
@@ -77,12 +94,64 @@ def test_06_existing_engines_unchanged():
     print("✓ Check 6: mock 引擎回归正常")
 
 
+def test_07_exa_engine_no_key():
+    """Check 7: exa 无 API key → 跳过（不抛异常，不返回 mock）"""
+    s = SearchSkill(config=SearchConfig(exa_api_key=""))
+    r = s.execute("search", {"query": "test", "engines": ["exa"], "max_results": 2})
+    # exa 无 key 时跳过，all_results 为空 → fallback mock
+    assert r["success"]
+    # fallback 到 mock，engines 变 ['mock']
+    assert r["data"]["engines"] == ["mock"]
+    print("✓ Check 7: exa 无 key → 降级 mock")
+
+
+def test_08_firecrawl_engine_no_key():
+    """Check 8: firecrawl 无 API key → 跳过（不抛异常）"""
+    s = SearchSkill(config=SearchConfig(firecrawl_api_key=""))
+    r = s.execute("search", {"query": "test", "engines": ["firecrawl"], "max_results": 2})
+    assert r["success"]
+    assert r["data"]["engines"] == ["mock"]
+    print("✓ Check 8: firecrawl 无 key → 降级 mock")
+
+
+def test_09_perplexity_engine_no_key():
+    """Check 9: perplexity 无 API key → 跳过（不抛异常）"""
+    s = SearchSkill(config=SearchConfig(perplexity_api_key=""))
+    r = s.execute("search", {"query": "test", "engines": ["perplexity"], "max_results": 2})
+    assert r["success"]
+    assert r["data"]["engines"] == ["mock"]
+    print("✓ Check 9: perplexity 无 key → 降级 mock")
+
+
+def test_10_multi_engine_no_keys():
+    """Check 10: 多引擎搜索（全部无 key）→ 正确聚合"""
+    s = SearchSkill(config=SearchConfig(
+        tavily_api_key="",
+        brave_api_key="",
+        exa_api_key="",
+        firecrawl_api_key="",
+        perplexity_api_key=""
+    ))
+    r = s.execute("search", {
+        "query": "test",
+        "engines": ["tavily", "brave", "exa", "firecrawl", "perplexity"],
+        "max_results": 5
+    })
+    assert r["success"]
+    assert r["data"]["engines"] == ["mock"]
+    print("✓ Check 10: 多引擎全无 key → mock 降级")
+
+
 if __name__ == "__main__":
-    print("=== AgentSearch smoke test (重构后 6/6) ===")
+    print("=== AgentSearch smoke test (重构后 10/10) ===")
     test_01_import()
     test_02_search_config()
     test_03_bing_real_search()
     test_04_bing_graceful_degrade()
     test_05_bing_cache()
     test_06_existing_engines_unchanged()
-    print("\n=== 6/6 check 通过 ===")
+    test_07_exa_engine_no_key()
+    test_08_firecrawl_engine_no_key()
+    test_09_perplexity_engine_no_key()
+    test_10_multi_engine_no_keys()
+    print("\n=== 10/10 check 通过 ===")

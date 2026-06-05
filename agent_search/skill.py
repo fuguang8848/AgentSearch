@@ -79,6 +79,9 @@ class SearchConfig:
     # API 配置
     tavily_api_key: str = field(default_factory=lambda: os.getenv("TAVILY_API_KEY", ""))
     brave_api_key: str = field(default_factory=lambda: os.getenv("BRAVE_API_KEY", ""))
+    exa_api_key: str = field(default_factory=lambda: os.getenv("EXA_API_KEY", ""))
+    firecrawl_api_key: str = field(default_factory=lambda: os.getenv("FIRECRAWL_API_KEY", ""))
+    perplexity_api_key: str = field(default_factory=lambda: os.getenv("PERPLEXITY_API_KEY", ""))
     # V 端 search-v.py 路径（Bing 引擎需要，可选）
     search_v_path: str = field(default_factory=lambda: os.getenv("SEARCH_V_PATH", ""))
 
@@ -246,7 +249,16 @@ class SearchSkill:
                 elif engine == "bing" and self.config.search_v_path:
                     results = self._search_bing(query, max_results)
                     used_engines.append("bing")
-                elif engine in ("tavily", "brave", "exa", "perplexity", "bing"):
+                elif engine == "exa" and self.config.exa_api_key:
+                    results = self._search_exa(query, max_results)
+                    used_engines.append("exa")
+                elif engine == "firecrawl" and self.config.firecrawl_api_key:
+                    results = self._search_firecrawl(query, max_results)
+                    used_engines.append("firecrawl")
+                elif engine == "perplexity" and self.config.perplexity_api_key:
+                    results = self._search_perplexity(query, max_results)
+                    used_engines.append("perplexity")
+                elif engine in ("tavily", "brave", "exa", "perplexity", "bing", "firecrawl"):
                     # API 未配置时跳过
                     continue
                 else:
@@ -423,6 +435,205 @@ class SearchSkill:
             ))
 
         return results
+
+    # ==================== Exa Search API ====================
+
+    def _search_exa(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        """
+        使用 Exa Search API 执行搜索
+
+        API 文档: https://docs.exa.ai/
+        """
+        import urllib.request
+        import urllib.parse
+
+        url = "https://api.exa.ai/search"
+
+        payload = json.dumps({
+            "query": query,
+            "numResults": min(max_results, 100),
+            "includeArticles": True,
+        })
+
+        headers = {
+            "Authorization": f"Bearer {self.config.exa_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=payload.encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if e.fp else ""
+            raise SearchAPIError(
+                "exa",
+                f"HTTP {e.code}: {error_body[:200]}",
+                status_code=e.code
+            )
+        except urllib.error.URLError as e:
+            raise SearchAPIError("exa", f"URL Error: {str(e.reason)}")
+
+        results = []
+        for item in data.get("results", []):
+            results.append(SearchResult(
+                url=item.get("url", ""),
+                title=item.get("title", ""),
+                content=item.get("snippet", ""),
+                engine="exa",
+                score=item.get("score", 0.0),
+                relevance=item.get("score", 0.0),
+                freshness=item.get("publishedDate", ""),
+                authority=0.5  # Exa 不直接提供权威性评分
+            ))
+
+        return results
+
+    # ==================== Firecrawl API ====================
+
+    def _search_firecrawl(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        """
+        使用 Firecrawl API 执行搜索（通过 /search 端点）
+
+        API 文档: https://docs.firecrawl.dev/
+        """
+        import urllib.request
+        import urllib.parse
+
+        base_url = "https://api.firecrawl.dev/v0/search"
+        params = urllib.parse.urlencode({
+            "query": query,
+            "limit": min(max_results, 20),
+        })
+
+        url = f"{base_url}?{params}"
+
+        headers = {
+            "Authorization": f"Bearer {self.config.firecrawl_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        req = urllib.request.Request(url, headers=headers, method="GET")
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if e.fp else ""
+            raise SearchAPIError(
+                "firecrawl",
+                f"HTTP {e.code}: {error_body[:200]}",
+                status_code=e.code
+            )
+        except urllib.error.URLError as e:
+            raise SearchAPIError("firecrawl", f"URL Error: {str(e.reason)}")
+
+        results = []
+        # Firecrawl v0/search 返回 { "data": [ { "url", "title", "description", ... } ] }
+        for item in data.get("data", []):
+            results.append(SearchResult(
+                url=item.get("url", ""),
+                title=item.get("title", ""),
+                content=item.get("description", ""),
+                engine="firecrawl",
+                score=0.0,  # Firecrawl 不直接提供分数
+                relevance=0.0,
+                freshness=item.get("publishedDate", ""),
+                authority=0.5  # Firecrawl 不提供权威性评分
+            ))
+
+        return results
+
+    # ==================== Perplexity API ====================
+
+    def _search_perplexity(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        """
+        使用 Perplexity API 执行搜索（Sonar 模型）
+
+        API 文档: https://docs.perplexity.ai/
+        """
+        import urllib.request
+        import urllib.parse
+
+        url = "https://api.perplexity.ai/chat/completions"
+
+        payload = json.dumps({
+            "model": "sonar",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that provides accurate, real-time information."
+                },
+                {
+                    "role": "user",
+                    "content": query
+                }
+            ],
+            "max_tokens": 1000,
+            "return_citations": True,
+        })
+
+        headers = {
+            "Authorization": f"Bearer {self.config.perplexity_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=payload.encode("utf-8"),
+            headers=headers,
+            method="POST"
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8") if e.fp else ""
+            raise SearchAPIError(
+                "perplexity",
+                f"HTTP {e.code}: {error_body[:200]}",
+                status_code=e.code
+            )
+        except urllib.error.URLError as e:
+            raise SearchAPIError("perplexity", f"URL Error: {str(e.reason)}")
+
+        results = []
+        # Perplexity 返回 citations 列表，格式为 URL
+        citations = data.get("citations", [])
+        # 也从 content 中解析出引用的 URL
+        for idx, citation_url in enumerate(citations[:max_results]):
+            results.append(SearchResult(
+                url=citation_url,
+                title=f"Result {idx + 1}",
+                content="",  # Perplexity chat 格式没有独立 snippet
+                engine="perplexity",
+                score=1.0 - (idx * 0.1),  # 按引用顺序递减
+                relevance=1.0 - (idx * 0.1),
+                freshness="",
+                authority=0.5
+            ))
+
+        # 如果没有 citations，至少记录一次成功的搜索
+        if not results:
+            results.append(SearchResult(
+                url="https://perplexity.ai/search",
+                title=f"Perplexity Sonar Search: {query}",
+                content=data.get("choices", [{}])[0].get("message", {}).get("content", ""),
+                engine="perplexity",
+                score=0.5,
+                relevance=0.5,
+                freshness="",
+                authority=0.5
+            ))
+
+        return results[:max_results]
 
     # ==================== Bing (V 端 search-v.py 集成) ====================
 
