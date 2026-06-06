@@ -369,8 +369,10 @@ class SafetySkill(SkillBase):
             "safety.classify": lambda ctx: self.classify_content(ctx.get("text", "")),
             "safety.check_tool": lambda ctx: self.check_tool_params(ctx.get("tool_name", ""), ctx.get("params", {})),
             "safety.audit": lambda ctx: self.audit_log(ctx.get("event", ""), ctx.get("data")),
-            "safety.check_permission": lambda ctx: self._check_permission(ctx.get("plugin_name", "")),
-            "safety.circuit_breaker_stats": lambda ctx: self._circuit_breaker_stats(),
+            "safety.check_permission": lambda ctx: self.check_permission(ctx.get("plugin_name", "")),
+            "safety.circuit_breaker_stats": lambda ctx: self.circuit_breaker_stats(ctx.get("name")),
+            "safety.circuit_breaker_reset": lambda ctx: self.reset_circuit_breaker(ctx.get("name", "")),
+            "safety.permission_summary": lambda ctx: self.permission_summary(),
         }
         if capability not in capability_map:
             return {
@@ -393,6 +395,20 @@ class SafetySkill(SkillBase):
                 result = self.check_tool_params(params.get("tool_name", ""), params.get("params", {}))
             elif action == "audit":
                 result = self.audit_log(params.get("event", ""), params.get("data", {}))
+            elif action == "check_permission":
+                result = self.check_permission(params.get("plugin_name", ""))
+            elif action == "circuit_breaker_stats":
+                result = self.circuit_breaker_stats(params.get("name"))
+            elif action == "circuit_breaker_reset":
+                result = self.reset_circuit_breaker(params.get("name", ""))
+            elif action == "register_scope":
+                result = self.register_scope(**{k: v for k, v in params.items() if k in (
+                    "plugin_name", "allowed_plugins", "denied_plugins", "dangerous_plugins",
+                    "allow_file_read", "allow_file_write", "allow_network", "allow_shell",
+                    "max_file_size_bytes"
+                )})
+            elif action == "permission_summary":
+                result = self.permission_summary()
             else:
                 return {
                     "success": False,
@@ -761,12 +777,17 @@ class SafetySkill(SkillBase):
 
         return {"recorded": recorded, "record": record}
 
-    # ==================== 权限与熔断接口 ====================
+    # ==================== 权限与熔断接口 (V 6/7 7:05 API 完整化) ====================
 
-    def _check_permission(self, plugin_name: str) -> dict:
-        """检查插件权限。"""
+    def check_permission(self, plugin_name: str) -> dict:
+        """检查插件权限。返回 {checked, plugin, allowed, reason}。
+
+        对应 execute(action="check_permission", params={"plugin_name": "X"})
+        对应 query(capability="safety.check_permission", context={...})
+        """
         if not self._permission_checker:
-            return {"checked": False, "reason": "permission check disabled"}
+            return {"checked": False, "plugin": plugin_name, "allowed": True,
+                    "reason": "permission check disabled (allow-by-default)"}
         allowed, reason = self._permission_checker.check_plugin(plugin_name)
         return {
             "checked": True,
@@ -775,13 +796,127 @@ class SafetySkill(SkillBase):
             "reason": reason,
         }
 
-    def _circuit_breaker_stats(self) -> dict:
-        """返回所有熔断器状态。"""
+    def circuit_breaker_stats(self, name: str | None = None) -> dict:
+        """返回熔断器状态。name=None 返回全部，name="X" 返回单个。
+
+        对应 execute(action="circuit_breaker_stats", params={"name": "X"?})
+        """
         if not self._circuit_breakers:
-            return {"enabled": False}
+            return {"enabled": False, "breakers": {}}
+        if name:
+            cb = self._circuit_breakers.get(name)
+            if not cb:
+                return {"enabled": True, "found": False, "name": name,
+                        "available": list(self._circuit_breakers.keys())}
+            return {"enabled": True, "found": True, "name": name, **cb.stats()}
         return {
             "enabled": True,
-            "breakers": {name: cb.stats() for name, cb in self._circuit_breakers.items()},
+            "breakers": {n: cb.stats() for n, cb in self._circuit_breakers.items()},
+            "any_open": any(cb.state == CircuitState.OPEN
+                            for cb in self._circuit_breakers.values()),
+        }
+
+    def reset_circuit_breaker(self, name: str = "") -> dict:
+        """重置熔断器。name="" 重置所有，name="X" 重置指定。
+
+        运维用：人为确认故障已修复后强制重置，避免等 timeout_seconds。
+
+        对应 execute(action="circuit_breaker_reset", params={"name": "X"?})
+        """
+        if not self._circuit_breakers:
+            return {"reset": False, "reason": "circuit breaker disabled"}
+        if not name:
+            # 重置所有
+            reset = []
+            for n, cb in self._circuit_breakers.items():
+                if cb.state != CircuitState.CLOSED:
+                    reset.append(n)
+                cb._state = CircuitState.CLOSED
+                cb._failure_count = 0
+            return {"reset": True, "reset_names": reset,
+                    "total": len(self._circuit_breakers)}
+        if name not in self._circuit_breakers:
+            return {"reset": False, "name": name,
+                    "available": list(self._circuit_breakers.keys())}
+        cb = self._circuit_breakers[name]
+        prev_state = cb.state.value
+        cb._state = CircuitState.CLOSED
+        cb._failure_count = 0
+        return {"reset": True, "name": name, "previous_state": prev_state,
+                "new_state": "closed"}
+
+    def register_scope(
+        self,
+        plugin_name: str,
+        allowed_plugins: list[str] | None = None,
+        denied_plugins: list[str] | None = None,
+        dangerous_plugins: list[str] | None = None,
+        allow_file_read: bool = True,
+        allow_file_write: bool = True,
+        allow_network: bool = True,
+        allow_shell: bool = False,
+        max_file_size_bytes: int | None = None,
+    ) -> dict:
+        """为指定插件注册独立 PermissionScope。返回 {registered, plugin_name}。
+
+        对应 execute(action="register_scope", params={...})
+        """
+        if not self._permission_checker:
+            return {"registered": False, "reason": "permission check disabled"}
+        if not plugin_name:
+            return {"registered": False, "reason": "plugin_name is required"}
+        scope = PermissionScope(
+            allowed_plugins=allowed_plugins or [],
+            denied_plugins=denied_plugins or [],
+            dangerous_plugins=dangerous_plugins or [],
+            allow_file_read=allow_file_read,
+            allow_file_write=allow_file_write,
+            allow_network=allow_network,
+            allow_shell=allow_shell,
+            max_file_size_bytes=max_file_size_bytes or (10 * 1024 * 1024),
+        )
+        self._permission_checker.register_scope(plugin_name, scope)
+        return {"registered": True, "plugin_name": plugin_name,
+                "scope": {"allow_shell": scope.allow_shell,
+                          "allow_network": scope.allow_network,
+                          "dangerous_plugins": scope.dangerous_plugins,
+                          "allowed_plugins": scope.allowed_plugins,
+                          "denied_plugins": scope.denied_plugins}}
+
+    def permission_summary(self) -> dict:
+        """权限配置摘要（用于审计）。"""
+        if not self._permission_checker:
+            return {"enabled": False}
+        return {"enabled": True, **self._permission_checker.summary()}
+
+    def capabilities(self) -> dict:
+        """列出所有可用 query capability + execute action（自描述）。"""
+        return {
+            "query_capabilities": [
+                "safety.check_input",
+                "safety.check_output",
+                "safety.classify",
+                "safety.check_tool",
+                "safety.audit",
+                "safety.check_permission",
+                "safety.circuit_breaker_stats",
+                "safety.circuit_breaker_reset",
+                "safety.permission_summary",
+            ],
+            "execute_actions": [
+                "check_input",
+                "check_output",
+                "classify",
+                "check_tool",
+                "audit",
+                "check_permission",
+                "circuit_breaker_stats",
+                "circuit_breaker_reset",
+                "register_scope",
+                "permission_summary",
+            ],
+            "circuit_breakers_enabled": self.config.enable_circuit_breaker,
+            "permission_check_enabled": self.config.enable_permission_check,
         }
 
     # ==================== 辅助方法 ====================
