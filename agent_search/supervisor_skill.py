@@ -82,7 +82,11 @@ class SupervisorSkill(SkillBase):
 
     def __init__(self, config: SupervisorConfig | None = None):
         """初始化 Supervisor"""
-        self.config = config or SupervisorConfig()
+        # 先解析 config，确保始终传递有效值给父类
+        resolved_config = config or SupervisorConfig()
+        
+        # 初始化自己的属性
+        self.config = resolved_config
         self._tasks: dict[str, Task] = {}
         self._workflows: dict[str, Workflow] = {}
         self._semaphore = asyncio.Semaphore(self.config.max_concurrent_tasks)
@@ -97,9 +101,10 @@ class SupervisorSkill(SkillBase):
         # 技能注册表（用于调用其他技能）
         self._skill_registry: dict[str, Any] = {}
 
-    # ==================== 标准 Skill 接口 ====================
+        # 调用父类初始化（传递已解析的 config，避免被 None 覆盖）
+        super().__init__(resolved_config)
 
-        super().__init__(config)
+    # ==================== 标准 Skill 接口 ====================
     def query(self, capability: str, context: dict | None = None) -> dict:
         """
         查询技能能力
