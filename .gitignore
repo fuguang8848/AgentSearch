@@ -47,3 +47,4 @@ htmlcov/
 
 # AgentMemory install 产物 (V 6/5 12:49 自动生成, 不入仓)
 memory/
+*.bak-pre-*

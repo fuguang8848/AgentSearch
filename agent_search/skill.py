@@ -941,6 +941,7 @@ class SearchSkill:
         def calculate_rank_score(r: SearchResult) -> float:
             return (
                 r.relevance * weights["relevance"] +
+                r.freshness * weights["freshness"] +   # V 6/7 08:30 fix: freshness 权重 (默认 0.3) 之前没乘进排序
                 r.authority * weights["authority"] +
                 r.score * weights["score"]
             )
