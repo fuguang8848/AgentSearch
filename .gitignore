@@ -44,3 +44,6 @@ htmlcov/
 # 本地 secrets（防 commit 误推）
 .env
 *.local
+
+# AgentMemory install 产物 (V 6/5 12:49 自动生成, 不入仓)
+memory/
