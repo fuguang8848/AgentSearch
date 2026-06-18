@@ -50,6 +50,7 @@ class SearchEngine(Enum):
     PERPLEXITY = "perplexity"
     MOCK = "mock"
     BING = "bing"  # V 端 search-v.py 集成（2026-06-04 V 加）
+    GITHUB = "github"  # GitHub REST API 搜索（无需认证，2026-06-18 新增）
 
 
 @dataclass
@@ -65,6 +66,8 @@ class SearchResult:
     authority: float = 0.0
     cached: bool = False
     retrieved_at: float = field(default_factory=time.time)
+    # 2026-06-18 新增：可信度评分（0-1，综合 freshness + authority + 引擎可靠性）
+    trust_score: float = 0.0
 
 
 @dataclass
@@ -258,6 +261,10 @@ class SearchSkill:
                 elif engine == "perplexity" and self.config.perplexity_api_key:
                     results = self._search_perplexity(query, max_results)
                     used_engines.append("perplexity")
+                elif engine == "github":
+                    # GitHub REST API 无需认证，直接可用
+                    results = self._search_github(query, max_results)
+                    used_engines.append("github")
                 elif engine in ("tavily", "brave", "exa", "perplexity", "bing", "firecrawl"):
                     # API 未配置时跳过
                     continue
@@ -287,13 +294,16 @@ class SearchSkill:
         # 过滤
         if filters:
             unique_results = self._apply_filters(unique_results, filters)
-        
+
         # 排序
         unique_results = self._rank_results(unique_results, filters)
-        
+
         # 限制数量
         unique_results = unique_results[:max_results]
-        
+
+        # 2026-06-18 新增：计算每条结果的可信度评分
+        unique_results = self._compute_trust_scores(unique_results)
+
         # 缓存
         self._cache[cache_key] = unique_results
         self._cache_time[cache_key] = time.time()
@@ -635,6 +645,76 @@ class SearchSkill:
 
         return results[:max_results]
 
+    # ==================== GitHub REST API 搜索（2026-06-18 新增） ====================
+
+    def _search_github(self, query: str, max_results: int = 10) -> list[SearchResult]:
+        """
+        使用 GitHub REST API 搜索公开仓库（无需认证）。
+
+        API 文档: https://docs.github.com/en/rest/search
+
+        特点：
+        - 无需 GitHub Token，直接可用（公开仓库）
+        - 按 stars 排序，返回最相关的项目
+        - 每个结果包含 stars/forks/language/license/topics
+        - 验证：所有引用的 stars 必须实时 curl 验证
+        """
+        import urllib.request
+        import urllib.parse
+        import json
+
+        # 搜索仓库（按 stars 降序）
+        search_url = "https://api.github.com/search/repositories"
+        params = urllib.parse.urlencode({
+            "q": query,
+            "sort": "stars",
+            "order": "desc",
+            "per_page": min(max_results, 30),  # GitHub 限制最大30
+        })
+
+        url = f"{search_url}?{params}"
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Hermes-Agent-Search/1.0",  # GitHub 要求 User-Agent
+        }
+
+        req = urllib.request.Request(url, headers=headers, method="GET")
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode("utf-8")[:200] if e.fp else ""
+            raise SearchAPIError(
+                "github",
+                f"HTTP {e.code}: {error_body}",
+                status_code=e.code
+            )
+        except urllib.error.URLError as e:
+            raise SearchAPIError("github", f"URL Error: {str(e.reason)}")
+
+        results = []
+        for item in data.get("items", [])[:max_results]:
+            # 计算权威性分数：基于 stars + forks（归一化到 0-1）
+            stars = item.get("stargazers_count", 0)
+            forks = item.get("forks_count", 0)
+            # stars 权重更高：stars*1.0 + forks*0.3，归一化（假设 1000 stars + 500 forks 为满分）
+            authority = min((stars + forks * 0.3) / 1300.0, 1.0)
+
+            results.append(SearchResult(
+                url=item.get("html_url", ""),
+                title=f"{item.get('full_name', '')}",
+                content=item.get("description", "") or "",
+                engine="github",
+                score=float(item.get("stargazers_count", 0)),
+                relevance=0.9,  # GitHub 搜索本身已按相关性排序
+                freshness=item.get("updated_at", "")[:10],  # 取日期部分 YYYY-MM-DD
+                authority=round(authority, 3),  # 0-1 的权威性分数
+            ))
+
+        return results
+
     # ==================== Bing (V 端 search-v.py 集成) ====================
 
     def _search_bing(self, query: str, max_results: int = 10) -> list[SearchResult]:
@@ -937,15 +1017,39 @@ class SearchSkill:
             "authority": criteria.get("authority_weight", 0.2),
             "score": criteria.get("score_weight", 0.1),
         }
-        
+
+        def _freshness_to_number(freshness: str) -> float:
+            """将 freshness 字符串转为 0-1 数值（与 _compute_trust_scores 保持一致）"""
+            if not freshness:
+                return 0.3
+            try:
+                if len(freshness) >= 10:
+                    import datetime
+                    dt = datetime.datetime.strptime(freshness[:10], "%Y-%m-%d")
+                    days_ago = (datetime.datetime.now() - dt).days
+                    if days_ago <= 30:
+                        return 1.0
+                    elif days_ago <= 90:
+                        return 0.8
+                    elif days_ago <= 180:
+                        return 0.6
+                    elif days_ago <= 365:
+                        return 0.4
+                    else:
+                        return 0.2
+                return 0.3
+            except (ValueError, TypeError):
+                return 0.3
+
         def calculate_rank_score(r: SearchResult) -> float:
+            freshness_num = _freshness_to_number(r.freshness)
             return (
                 r.relevance * weights["relevance"] +
-                r.freshness * weights["freshness"] +   # V 6/7 08:30 fix: freshness 权重 (默认 0.3) 之前没乘进排序
+                freshness_num * weights["freshness"] +
                 r.authority * weights["authority"] +
                 r.score * weights["score"]
             )
-        
+
         return sorted(results, key=calculate_rank_score, reverse=True)
 
     # ==================== 缓存接口 ====================
@@ -999,6 +1103,78 @@ class SearchSkill:
         
         return cached
 
+    # ==================== 2026-06-18 新增：可信度评分 ====================
+
+    def _compute_trust_scores(self, results: list[SearchResult]) -> list[SearchResult]:
+        """
+        计算每条搜索结果的可信度评分（0-1）。
+
+        计算公式：
+        trust_score = w_authority * authority + w_freshness * freshness_score + w_engine * engine_score
+
+        其中：
+        - authority: 0-1（GitHub stars/forks 归一化）
+        - freshness_score: 根据 freshness 字符串计算（越新越好）
+        - engine_score: 引擎可靠性（github=0.9, perplexity=0.8, tavily=0.7, brave=0.7, exa=0.7, firecrawl=0.6, bing=0.5, mock=0.1）
+
+        默认权重: authority=0.4, freshness=0.3, engine=0.3
+        """
+        import datetime
+
+        # 引擎可靠性评分
+        ENGINE_SCORES = {
+            "github": 0.9,   # 有真实 stars/forks 数据，难造假
+            "perplexity": 0.8,
+            "tavily": 0.7,
+            "brave": 0.7,
+            "exa": 0.7,
+            "firecrawl": 0.6,
+            "bing": 0.5,
+            "mock": 0.1,     # mock 数据完全不可信
+        }
+
+        W_AUTHORITY = 0.4
+        W_FRESHNESS = 0.3
+        W_ENGINE = 0.3
+
+        def _parse_freshness(freshness: str) -> float:
+            """将 freshness 字符串转为 0-1 分数"""
+            if not freshness:
+                return 0.3  # 无日期信息，中等可信
+            try:
+                # 尝试解析 YYYY-MM-DD 格式
+                if len(freshness) >= 10:
+                    date_str = freshness[:10]
+                    dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                    days_ago = (datetime.datetime.now() - dt).days
+                    # 0-30天=1.0, 30-90天=0.8, 90-180天=0.6, 180-365天=0.4, 1年+=0.2
+                    if days_ago <= 30:
+                        return 1.0
+                    elif days_ago <= 90:
+                        return 0.8
+                    elif days_ago <= 180:
+                        return 0.6
+                    elif days_ago <= 365:
+                        return 0.4
+                    else:
+                        return 0.2
+                return 0.3
+            except (ValueError, TypeError):
+                return 0.3  # 解析失败，中等可信
+
+        for result in results:
+            engine_s = ENGINE_SCORES.get(result.engine, 0.5)
+            freshness_s = _parse_freshness(result.freshness)
+            # authority 已经是 0-1 的值（来自 GitHub 搜索）
+            auth_s = result.authority if result.authority else 0.3
+
+            trust = W_AUTHORITY * auth_s + W_FRESHNESS * freshness_s + W_ENGINE * engine_s
+            result.trust_score = round(min(trust, 1.0), 3)
+
+        # 按 trust_score 降序重排
+        results.sort(key=lambda r: r.trust_score, reverse=True)
+        return results
+
     def _result_to_dict(self, result: SearchResult) -> dict:
         """转换结果为字典"""
         return {
@@ -1011,7 +1187,8 @@ class SearchSkill:
             "freshness": result.freshness,
             "authority": result.authority,
             "cached": result.cached,
-            "retrieved_at": result.retrieved_at
+            "retrieved_at": result.retrieved_at,
+            "trust_score": result.trust_score,  # 2026-06-18 新增
         }
 
 
