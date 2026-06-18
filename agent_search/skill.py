@@ -13,6 +13,7 @@ Agent Symphony 技能交响乐的信息获取中心
 import os
 import time
 import json
+import math
 import hashlib
 from typing import Any, Optional
 from dataclasses import dataclass, field
@@ -696,11 +697,12 @@ class SearchSkill:
 
         results = []
         for item in data.get("items", [])[:max_results]:
-            # 计算权威性分数：基于 stars + forks（归一化到 0-1）
+            # 计算权威性分数：基于 stars + forks（log 归一化到 0-1）
+            # V 6/18 修 SOP #15 应验: 线性公式 saturate 1000+ stars, trust_score 全 0.97
+            # 改为 log10 scale: 10 stars=0.25, 100=0.5, 1000=0.75, 10000=1.0
             stars = item.get("stargazers_count", 0)
             forks = item.get("forks_count", 0)
-            # stars 权重更高：stars*1.0 + forks*0.3，归一化（假设 1000 stars + 500 forks 为满分）
-            authority = min((stars + forks * 0.3) / 1300.0, 1.0)
+            authority = min(math.log10(stars + 1 + forks * 0.3) / 4, 1.0)
 
             results.append(SearchResult(
                 url=item.get("html_url", ""),
