@@ -2,14 +2,6 @@
 
 多引擎搜索技能，为 Agent 提供智能信息检索能力。
 
-> **V 6/19 18:38 README 修真** (SOP #34 跨仓 L1 对比, 修真 AgentSearch):
-> - 失实 1: 7 引擎清单 — 实际 SearchEngine enum 8 引擎 (TAVILY/BRAVE/EXA/FIRECRAWL/PERPLEXITY/MOCK/BING/GITHUB)
-> - 失实 2: Exa/Perplexity/Firecrawl 标"未实现" — 实际 8 引擎全实现 (_search_xxx 方法)
-> - 失实 3: README 缺 GITHUB 引擎 (V 6/18 新增, 无需认证, REST API)
-> - 失实 4: README 缺 trust_score log scale 算法 (V 6/18 SOP #15 应验修)
-> - 失实 5: `AgentSearchSkill` — 实际是 `SearchSkill` (顶层)
-> - 失实 6: SearchSkill 暴露方法是 `execute(action, params)` / `query(capability, context)` / `notify(event, data)`
-
 ## 特性
 
 - **多引擎支持**：8 引擎 (Tavily / Brave / Exa / Perplexity / Firecrawl / Bing / GitHub / Mock)
@@ -31,11 +23,10 @@
 | **GitHub** | (无需 key) | ✅ V 6/18 新增 | `_search_github` line 651 | GitHub REST API 搜索 |
 | **Mock** | (无需 key) | ✅ 兜底 | `_execute_search_mock` line 799 | 当所有真实 API 都失败时使用 |
 
-## Trust Score 算法 (V 6/18 修真, SOP #15 #5 应验)
+## Trust Score 算法
 
 ```python
-# V 6/18 修: 旧线性公式 saturate 1000+ stars, trust_score 全 0.97
-# 改 log10 scale: 10 stars=0.25, 100=0.5, 1000=0.75, 10000=1.0
+# 信任分 = 加权权威分(对数) + 新鲜度分 + 引擎分
 authority = min(math.log10(stars + 1 + forks * 0.3) / 4, 1.0)
 trust_score = w_authority * authority + w_freshness * freshness_score + w_engine * engine_score
 ```

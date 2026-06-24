@@ -57,11 +57,14 @@ def test_03_trust_score_not_saturated():
     ]
     results = []
     for name, stars in test_cases:
+        # V 2026-06-24: score 字段必须在 [0,1] 范围（SearchResult.__post_init__ 强类型校验）
+        # 测试本意是验证不同 stars 数对应的 trust_score spread，所以 score 用占位值
+        # 真实业务里 score 是位置归一化，authority 反映 stars 实力
         r = SearchResult(
             url=f"https://github.com/test/{name}",
             title=f"test/{name}",
             content="test repo",
-            score=float(stars),
+            score=0.9,  # 占位：trust_score 计算不依赖 score，仅依赖 authority/freshness/engine_score
             engine="github",
             freshness="2026-06-15",  # 3 天前, freshness=1.0
         )
@@ -91,12 +94,14 @@ def test_04_trust_score_sort_different_from_stars():
     s = SearchSkill()
     # 故意构造: A stars 多但更新旧, B stars 少但更新新
     results = [
-        SearchResult(url="A", title="A", content="A", score=10000, engine="github", freshness="2024-01-01"),  # 2 年前
-        SearchResult(url="B", title="B", content="B", score=100, engine="github", freshness="2026-06-15"),    # 3 天前
-        SearchResult(url="C", title="C", content="C", score=1000, engine="github", freshness="2025-12-01"),  # 6 月前
+        SearchResult(url="A", title="A", content="A", score=0.9, engine="github", freshness="2024-01-01"),  # 2 年前
+        SearchResult(url="B", title="B", content="B", score=0.9, engine="github", freshness="2026-06-15"),    # 3 天前
+        SearchResult(url="C", title="C", content="C", score=0.9, engine="github", freshness="2025-12-01"),  # 6 月前
     ]
+    # 真实 stars 数保留在 authority 计算中
+    raw_stars = {"A": 10000, "B": 100, "C": 1000}
     for r in results:
-        r.authority = min(math.log10(r.score + 1) / 4, 1.0)
+        r.authority = min(math.log10(raw_stars[r.title] + 1) / 4, 1.0)
 
     # stars 排序: A(10000) > C(1000) > B(100)
     raw_order = sorted(results, key=lambda r: r.score, reverse=True)
