@@ -22,6 +22,8 @@ import shutil
 import unittest
 from pathlib import Path
 
+import pytest
+
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -327,6 +329,7 @@ class TestSymlinkResolution(unittest.TestCase):
         """清理临时目录"""
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
+    @pytest.mark.skipif(os.name == 'nt', reason="Windows symlink 需要开发者模式或 admin；Linux/macOS 覆盖此场景")
     def test_resolve_symlink(self):
         """解析符号链接"""
         resolved = self.loader.resolve_path("link_prompt.txt")
