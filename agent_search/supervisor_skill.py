@@ -94,6 +94,7 @@ class SupervisorSkill(SkillBase):
         self._monitoring = False
         self._monitor_task: asyncio.Task | None = None
         self._shutdown = False
+        self._async_tasks: dict[str, asyncio.Task] = {}  # 追踪asyncio.Task以支持取消
         
         # 事件回调
         self._event_handlers: dict[str, list[Callable]] = defaultdict(list)
@@ -193,15 +194,31 @@ class SupervisorSkill(SkillBase):
             return self.retry_task(task_id)
         
         elif action == "start_monitoring":
-            # 启动监控循环
-            asyncio.create_task(self.monitor_loop())
+            # 启动监控循环（詹姆斯高斯林JVM GC：任务必须被追踪，否则泄漏）
+            if self._monitor_task is None or self._monitor_task.done():
+                self._monitor_task = asyncio.create_task(self.monitor_loop())
             return {"status": "monitoring_started"}
-        
+
         elif action == "stop_monitoring":
-            # 停止监控循环
+            # 停止监控循环（稻盛和夫敬天爱人：资源必须正确释放）
+            # 詹姆斯高斯林JVM GC：异步任务必须被追踪和等待
             self._shutdown = True
-            if self._monitor_task:
+            if self._monitor_task and not self._monitor_task.done():
                 self._monitor_task.cancel()
+                # 在非async上下文中，使用run_until_complete等待取消完成
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # 事件循环已在运行，在后台调度等待
+                        asyncio.ensure_future(self._wait_task_cancel(self._monitor_task))
+                    else:
+                        loop.run_until_complete(self._monitor_task)
+                except asyncio.CancelledError:
+                    pass
+                except RuntimeError:
+                    pass  # 无事件循环时忽略
+            self._monitor_task = None
+            self._shutdown = False  # 重置标志位供下次使用
             return {"status": "monitoring_stopped"}
         
         else:
@@ -231,6 +248,18 @@ class SupervisorSkill(SkillBase):
     # V 21:52 SkillBase delegation (V 反思 SOP 第 10 件加强版: util 化)
     def _handle_query(self, capability: str, context: dict) -> dict:
         return self.query(capability, context)
+
+
+    async def _wait_task_cancel(self, task: asyncio.Task):
+        """等待任务被取消（用于非async上下文）"""
+        try:
+            await task
+        except asyncio.CalledProcessError:
+            pass
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
     def _handle_execute(self, action: str, params: dict) -> dict:
         return self.execute(action, params)
@@ -343,8 +372,15 @@ class SupervisorSkill(SkillBase):
         if task.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED):
             return {"error": f"任务已结束，无法取消: {task.status.value}"}
         
+        # 取消asyncio.Task（如果存在）
+        async_task = self._async_tasks.get(task_id)
+        if async_task and not async_task.done():
+            async_task.cancel()
+        
         task.status = TaskStatus.CANCELLED
         task.completed_at = time.time()
+        # 从追踪中移除
+        self._async_tasks.pop(task_id, None)
         logger.info(f"任务已取消: {task_id}")
         
         return {"task_id": task_id, "status": "cancelled"}
@@ -563,7 +599,10 @@ class SupervisorSkill(SkillBase):
                     )
                 
                 task_id_map[step_id] = task_id
-                tasks.append(self._run_task(task_id))
+                # 创建并追踪asyncio.Task以便支持取消
+                async_task = asyncio.create_task(self._run_task(task_id))
+                self._async_tasks[task_id] = async_task
+                tasks.append(async_task)
             
             # 等待这一批所有任务完成
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -605,6 +644,8 @@ class SupervisorSkill(SkillBase):
                 task.status = TaskStatus.COMPLETED
                 task.completed_at = time.time()
                 logger.info(f"任务完成: {task_id} - {task.name}")
+                # 任务完成后从追踪中移除
+                self._async_tasks.pop(task_id, None)
                 
             except asyncio.TimeoutError:
                 task.error = f"任务超时 ({self.config.task_timeout}秒)"
@@ -632,7 +673,8 @@ class SupervisorSkill(SkillBase):
             logger.info(f"任务将在延迟后重试: {task.task_id} (第 {task.retries} 次)")
             
             await asyncio.sleep(2 ** task.retries)  # 指数退避
-            asyncio.create_task(self._run_task(task.task_id))
+            # 存储任务以便支持取消
+            self._async_tasks[task.task_id] = asyncio.create_task(self._run_task(task.task_id))
         else:
             # 使用降级策略
             if task.fallback_fn:
@@ -698,6 +740,13 @@ class SupervisorSkill(SkillBase):
                 for task in self._tasks.values():
                     if task.status == TaskStatus.RUNNING:
                         task.last_heartbeat = time.time()
+                
+                # 清理已完成的asyncio.Task
+                done_task_ids = [
+                    tid for tid, t in self._async_tasks.items() if t.done()
+                ]
+                for tid in done_task_ids:
+                    self._async_tasks.pop(tid, None)
                 
                 # 发送心跳事件
                 progress = self.get_progress()

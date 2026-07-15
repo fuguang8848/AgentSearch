@@ -69,11 +69,40 @@ class AgentRegistry(SkillBase):
         super().__init__(map_file)
 
     # V 21:52 SkillBase delegation (V 反思 SOP 第 10 件加强版: util 化)
+    # Fix S1 (Remaining-Components-Audit): _handle_query / _handle_execute 不再调
+    # self.query / self.execute（那样会无限递归——SkillBase.query 调用 _handle_query），
+    # 改为直接走原 capability_map / if-elif 逻辑。
     def _handle_query(self, capability: str, context: dict) -> dict:
-        return self.query(capability, context)
+        context = context or {}
+        capability_map = {
+            "manager.register": self._do_register,
+            "manager.switch": self._do_switch,
+            "manager.get_active": self._do_get_active,
+            "manager.list": self._do_list,
+            "manager.reload": self._do_reload,
+            "manager.unregister": self._do_unregister,
+            "manager.load_prompt": self._do_load_prompt,
+        }
+        if capability not in capability_map:
+            return {"success": False, "error": f"未知 capability: {capability}"}
+        return capability_map[capability](context)
 
     def _handle_execute(self, action: str, params: dict) -> dict:
-        return self.execute(action, params)
+        if action == "register":
+            return self._do_register(params)
+        if action == "switch":
+            return self._do_switch(params)
+        if action == "get_active":
+            return self._do_get_active(params)
+        if action == "list":
+            return self._do_list(params)
+        if action == "reload":
+            return self._do_reload(params)
+        if action == "unregister":
+            return self._do_unregister(params)
+        if action == "load_prompt":
+            return self._do_load_prompt(params)
+        return {"success": False, "error": f"未知 action: {action}"}
     def register(self, alias: str, profile: AgentProfile) -> dict:
         """注册 Agent，返回注册结果"""
         if not isinstance(profile, AgentProfile):
@@ -208,35 +237,39 @@ class PromptLoader:
         
         Returns:
             prompt 文本内容
+        
+        Fix: TOCTOU 修复 - 先打开文件获取内容，再检查/更新缓存，
+        避免 exists()+stat()+open() 三步之间的文件变化导致的问题。
+        使用 try/except 捕获文件缺失错误作为缓存未命中的兜底。
         """
         try:
             prompt_path = self.resolve_path(profile.prompt_path)
-            
-            # 检查文件是否存在
-            if not prompt_path.exists():
-                logger.warning(f"Prompt 文件不存在: {prompt_path}")
-                return f"[Prompt 文件不存在: {prompt_path}]"
-            
-            # 获取当前文件修改时间
+
+            # 获取当前文件修改时间（用于更新缓存时间戳）
             current_mtime = prompt_path.stat().st_mtime
-            
+
             # 检查缓存是否有效（文件未修改）
             if alias in self._cache:
                 if alias in self._mtime and self._mtime[alias] >= current_mtime:
                     logger.debug(f"从缓存加载 prompt: {alias}")
                     return self._cache[alias]
-            
-            # 重新加载
-            with open(prompt_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            
+
+            # 重新加载（先读内容，后更新缓存）
+            # 修复 TOCTOU: 直接 open 读取，让 OS 处理文件缺失情况
+            try:
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except FileNotFoundError:
+                logger.warning(f"Prompt 文件已被删除或移动: {prompt_path}")
+                return f"[Prompt 文件不存在: {prompt_path}]"
+
             # 更新缓存
             self._cache[alias] = content
             self._mtime[alias] = current_mtime
             logger.debug(f"重新加载 prompt: {alias} from {prompt_path}")
-            
+
             return content
-            
+
         except Exception as e:
             logger.error(f"加载 prompt 失败: {alias} - {e}")
             return f"[加载失败: {e}]"
@@ -267,21 +300,23 @@ class PromptLoader:
     def check_reload(self, alias: str, profile: AgentProfile) -> bool:
         """
         检查是否需要重新加载
-        
+
         Returns:
             True 如果文件已修改需要重新加载
+
+        Fix: TOCTOU 修复 - 使用 try/except 替代 exists()+stat() 分离检查，
+        让 stat() 失败时自然返回 False（文件不存在→无需 reload）。
         """
         try:
             prompt_path = self.resolve_path(profile.prompt_path)
-            if not prompt_path.exists():
-                return False
-            
             current_mtime = prompt_path.stat().st_mtime
             old_mtime = self._mtime.get(alias, 0)
-            
+
             if current_mtime > old_mtime:
                 logger.info(f"检测到文件变化，重新加载: {alias}")
                 return True
+            return False
+        except FileNotFoundError:
             return False
         except Exception:
             return False

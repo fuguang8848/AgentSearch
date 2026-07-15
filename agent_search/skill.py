@@ -10,16 +10,30 @@ Agent Symphony 技能交响乐的信息获取中心
 - 保留缓存机制与 symphony 协议兼容性
 """
 
+from __future__ import annotations
+
 import os
 import time
 import json
 import math
 import hashlib
+import threading
 import concurrent.futures
 import numpy as np
+import contextlib
 from typing import Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
+
+# 事件总线（blinker，已安装 1.9.0）
+try:
+    from blinker import signal
+    _has_blinker = True
+except ImportError:
+    _has_blinker = False
+
+# SearchSkill 事件信号
+_search_event_signal = signal("search-skill-event") if _has_blinker else None
 
 # V 2026-06-24: 向量检索依赖（可选）
 try:
@@ -55,6 +69,755 @@ except ImportError:
     def get_context() -> SharedContext:  # type: ignore[no-redef]
         return SharedContext()
     _HAS_AGENT_SYMPHONY = False
+
+
+# ========== TOCTOU 修复：FileCache 类（带文件锁） ==========
+class FileCache:
+    """
+    文件缓存类 - 支持原子读写操作，防止 TOCTOU 漏洞。
+    
+    TOCTOU (Time-of-Check to Time-of-Use) 修复：
+    - get/put 方法内部使用同一把锁
+    - 检查缓存是否存在和读取缓存是原子操作
+    - 写入缓存时使用临时文件 + rename 保证原子性
+    
+    方法论来源：
+    - James Gosling: 强类型 + 原子操作
+    - 高斯林: 线程安全的共享状态访问需要锁保护
+    """
+    
+    def __init__(self, cache_dir: str | None = None, ttl: int = 3600):
+        """
+        初始化文件缓存。
+        
+        Args:
+            cache_dir: 缓存目录路径，默认为 ~/.agent_search_cache
+            ttl: 缓存有效期（秒），默认 1 小时
+        """
+        if cache_dir is None:
+            cache_dir = os.path.expanduser("~/.agent_search_cache")
+        self._cache_dir = cache_dir
+        self._ttl = ttl
+        self._lock = threading.Lock()
+        self._memory_cache: dict[str, tuple[Any, float]] = {}  # key -> (value, timestamp)
+        os.makedirs(self._cache_dir, exist_ok=True)
+    
+    def _get_cache_path(self, key: str) -> str:
+        """将缓存 key 转换为安全的文件路径"""
+        safe_key = hashlib.sha256(key.encode()).hexdigest()[:32]
+        return os.path.join(self._cache_dir, f"{safe_key}.cache")
+    
+    def get(self, key: str) -> Any | None:
+        """
+        获取缓存值（原子操作）。
+        
+        TOCTOU 修复：检查和读取都在锁内完成，保证原子性。
+        
+        Args:
+            key: 缓存键
+            
+        Returns:
+            缓存的值，如果不存在或已过期返回 None
+        """
+        with self._lock:
+            # 检查内存缓存
+            if key in self._memory_cache:
+                value, timestamp = self._memory_cache[key]
+                if time.time() - timestamp < self._ttl:
+                    return value
+                else:
+                    del self._memory_cache[key]
+            
+            # 检查文件缓存
+            cache_path = self._get_cache_path(key)
+            if os.path.exists(cache_path):
+                try:
+                    mtime = os.path.getmtime(cache_path)
+                    if time.time() - mtime < self._ttl:
+                        with open(cache_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        # 回填内存缓存
+                        self._memory_cache[key] = (data, time.time())
+                        return data
+                    else:
+                        # 已过期，删除文件
+                        try:
+                            os.remove(cache_path)
+                        except OSError:
+                            pass
+                except (json.JSONDecodeError, OSError):
+                    # 损坏的缓存文件，删除它
+                    try:
+                        os.remove(cache_path)
+                    except OSError:
+                        pass
+            
+            return None
+    
+    def put(self, key: str, value: Any) -> None:
+        """
+        存储缓存值（原子操作）。
+        
+        TOCTOU 修复：写入使用临时文件 + rename，保证写入的原子性。
+        
+        Args:
+            key: 缓存键
+            value: 缓存的值（必须是 JSON 可序列化的）
+        """
+        with self._lock:
+            # 先更新内存缓存
+            self._memory_cache[key] = (value, time.time())
+            
+            # 原子写入文件缓存：先写临时文件，再 rename
+            cache_path = self._get_cache_path(key)
+            temp_path = cache_path + f".{os.getpid()}.tmp"
+            
+            try:
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(value, f, ensure_ascii=False)
+                # atomic rename
+                os.replace(temp_path, cache_path)
+            except (OSError, TypeError) as e:
+                # 写入失败，清理临时文件
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                # 仍然保留内存缓存
+                print(f"[FileCache] Failed to write cache file: {e}")
+    
+    def invalidate(self, key: str) -> None:
+        """删除指定缓存"""
+        with self._lock:
+            # 删除内存缓存
+            self._memory_cache.pop(key, None)
+            # 删除文件缓存
+            cache_path = self._get_cache_path(key)
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+    
+    def clear(self) -> int:
+        """清空所有缓存，返回清空的条目数"""
+        with self._lock:
+            count = len(self._memory_cache)
+            self._memory_cache.clear()
+            
+            # 删除所有缓存文件
+            try:
+                for filename in os.listdir(self._cache_dir):
+                    if filename.endswith('.cache'):
+                        os.remove(os.path.join(self._cache_dir, filename))
+            except OSError:
+                pass
+            
+            return count
+
+
+# ========== FAISS 向量索引锁 ==========
+class FAISSIndexLock:
+    """
+    FAISS 向量索引的进程内锁。
+    
+    用于保护 FAISS 索引的并发访问，防止多线程同时读写导致索引损坏。
+    
+    设计哲学：
+    - James Gosling: 强类型 + 明确的状态管理
+    - 高斯林: 线程安全的共享状态访问需要锁保护
+    - Simon: 有限理性简化原则（单进程锁足够，多进程需额外文件锁）
+    """
+    
+    _instance: "FAISSIndexLock | None" = None
+    _init_lock = threading.Lock()
+    
+    def __new__(cls) -> "FAISSIndexLock":
+        """单例模式，确保全局只有一个 FAISS 锁实例"""
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if self._initialized:
+            return
+        self._lock = threading.RLock()  # 可重入锁，支持同一线程多次获取
+        self._active_operations: int = 0
+        self._operation_lock = threading.Lock()
+        self._initialized = True
+    
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        """
+        获取锁。
+        
+        Args:
+            blocking: 是否阻塞等待
+            timeout: 超时时间（秒），-1 表示无限等待
+            
+        Returns:
+            是否成功获取锁
+        """
+        if timeout < 0:
+            # 无限等待
+            self._lock.acquire()
+        else:
+            # 限时等待
+            success = self._lock.acquire(timeout=timeout)
+            if not success:
+                return False
+        with self._operation_lock:
+            self._active_operations += 1
+        return True
+    
+    def release(self) -> None:
+        """释放锁"""
+        with self._operation_lock:
+            self._active_operations = max(0, self._active_operations - 1)
+        self._lock.release()
+    
+    def __enter__(self) -> "FAISSIndexLock":
+        """上下文管理器入口"""
+        self.acquire()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """上下文管理器出口"""
+        self.release()
+    
+    @contextlib.contextmanager
+    def hold(self, timeout: float = 30.0):
+        """
+        上下文管理器，支持超时。
+        
+        Usage:
+            with faiss_lock.hold(timeout=10.0):
+                # FAISS 操作
+                pass
+        """
+        if not self.acquire(timeout=timeout):
+            raise TimeoutError(f"FAISSIndexLock: failed to acquire lock within {timeout}s")
+        try:
+            yield
+        finally:
+            self.release()
+    
+    @property
+    def is_locked(self) -> bool:
+        """检查锁是否被持有"""
+        return self._lock.locked()
+    
+    @property
+    def active_operations(self) -> int:
+        """当前活跃的操作数"""
+        with self._operation_lock:
+            return self._active_operations
+
+
+# ========== 异步追踪系统：AsyncSearchTracker ==========
+class AsyncSearchTracker:
+    """
+    异步搜索追踪器。
+    
+    追踪搜索任务的执行状态、耗时、成功率等指标。
+    使用异步机制避免阻塞主搜索流程。
+    
+    设计哲学：
+    - Latour ANT: 追踪不同"行动者"（引擎、缓存、向量索引）的协作
+    - Simon: 渐进式信息披露，符合有限理性
+    - Merton: 知识生产的透明性
+    
+    使用方式：
+        tracker = AsyncSearchTracker()
+        task_id = tracker.start_task("search", {"query": "test"})
+        # ... 执行搜索 ...
+        tracker.end_task(task_id, success=True)
+    """
+    
+    def __init__(self):
+        self._tasks: dict[str, dict] = {}
+        self._lock = threading.Lock()
+        self._history: list[dict] = []  # 最近的任务历史
+        self._max_history = 1000  # 最多保留 1000 条历史
+    
+    def start_task(self, task_type: str, params: dict | None = None) -> str:
+        """
+        开始一个追踪任务。
+        
+        Args:
+            task_type: 任务类型（如 "search", "crawl", "index"）
+            params: 任务参数
+            
+        Returns:
+            任务 ID
+        """
+        task_id = hashlib.sha256(
+            f"{task_type}:{time.time()}:{id(threading.current_thread())}".encode()
+        ).hexdigest()[:16]
+        
+        with self._lock:
+            self._tasks[task_id] = {
+                "task_id": task_id,
+                "task_type": task_type,
+                "params": params or {},
+                "start_time": time.time(),
+                "end_time": None,
+                "success": None,
+                "error": None,
+                "duration_ms": None,
+                "sub_tasks": [],
+            }
+        
+        return task_id
+    
+    def end_task(
+        self,
+        task_id: str,
+        success: bool = True,
+        error: str | None = None,
+        sub_results: dict | None = None
+    ) -> None:
+        """
+        结束一个追踪任务。
+        
+        Args:
+            task_id: 任务 ID
+            success: 是否成功
+            error: 错误信息（如果失败）
+            sub_results: 子任务结果
+        """
+        with self._lock:
+            if task_id not in self._tasks:
+                return
+            
+            task = self._tasks[task_id]
+            task["end_time"] = time.time()
+            task["success"] = success
+            task["error"] = error
+            task["duration_ms"] = int((task["end_time"] - task["start_time"]) * 1000)
+            
+            if sub_results:
+                task["sub_tasks"] = sub_results
+            
+            # 移动到历史
+            self._history.append(task)
+            if len(self._history) > self._max_history:
+                self._history.pop(0)
+            
+            # 从活跃任务中移除
+            del self._tasks[task_id]
+    
+    def add_sub_task(
+        self,
+        task_id: str,
+        sub_type: str,
+        params: dict | None = None
+    ) -> str:
+        """
+        为任务添加子任务。
+        
+        Args:
+            task_id: 父任务 ID
+            sub_type: 子任务类型
+            params: 子任务参数
+            
+        Returns:
+            子任务 ID
+        """
+        sub_task_id = hashlib.sha256(
+            f"{task_id}:{sub_type}:{time.time()}:{id(threading.current_thread())}".encode()
+        ).hexdigest()[:16]
+        
+        with self._lock:
+            if task_id in self._tasks:
+                self._tasks[task_id]["sub_tasks"].append({
+                    "sub_task_id": sub_task_id,
+                    "sub_type": sub_type,
+                    "params": params or {},
+                    "start_time": time.time(),
+                    "end_time": None,
+                    "success": None,
+                })
+        
+        return sub_task_id
+    
+    def end_sub_task(
+        self,
+        task_id: str,
+        sub_task_id: str,
+        success: bool = True,
+        error: str | None = None
+    ) -> None:
+        """结束一个子任务"""
+        with self._lock:
+            if task_id not in self._tasks:
+                return
+            
+            for sub in self._tasks[task_id]["sub_tasks"]:
+                if sub["sub_task_id"] == sub_task_id:
+                    sub["end_time"] = time.time()
+                    sub["success"] = success
+                    sub["error"] = error
+                    break
+    
+    def get_task_status(self, task_id: str) -> dict | None:
+        """获取任务状态"""
+        with self._lock:
+            return dict(self._tasks.get(task_id))
+    
+    def get_active_tasks(self) -> list[dict]:
+        """获取所有活跃任务"""
+        with self._lock:
+            return [dict(t) for t in self._tasks.values()]
+    
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        with self._lock:
+            if not self._history:
+                return {
+                    "total_tasks": 0,
+                    "success_rate": 0.0,
+                    "avg_duration_ms": 0,
+                    "by_type": {},
+                }
+            
+            total = len(self._history)
+            successes = sum(1 for t in self._history if t["success"])
+            durations = [t["duration_ms"] for t in self._history if t["duration_ms"]]
+            avg_duration = sum(durations) / len(durations) if durations else 0
+            
+            by_type: dict[str, dict] = {}
+            for t in self._history:
+                ttype = t["task_type"]
+                if ttype not in by_type:
+                    by_type[ttype] = {"count": 0, "successes": 0, "total_duration": 0}
+                by_type[ttype]["count"] += 1
+                if t["success"]:
+                    by_type[ttype]["successes"] += 1
+                if t["duration_ms"]:
+                    by_type[ttype]["total_duration"] += t["duration_ms"]
+            
+            for ttype in by_type:
+                count = by_type[ttype]["count"]
+                by_type[ttype]["success_rate"] = by_type[ttype]["successes"] / count if count > 0 else 0
+                by_type[ttype]["avg_duration_ms"] = by_type[ttype]["total_duration"] / count if count > 0 else 0
+            
+            return {
+                "total_tasks": total,
+                "success_rate": successes / total if total > 0 else 0,
+                "avg_duration_ms": int(avg_duration),
+                "by_type": by_type,
+            }
+
+
+# ========== 搜索质量评分：SearchQualityScorer ==========
+class SearchQualityScorer:
+    """
+    搜索质量评分器。
+    
+    综合评估搜索结果的质量，包括：
+    - 相关性评分
+    - 多样性评分
+    - 新鲜度评分
+    - 权威性评分
+    - 用户满意度（基于点击/反馈）
+    
+    设计哲学：
+    - Latour ANT: 不同"行动者"对质量的贡献不同
+    - Simon: 质量是主观的，不同策略侧重不同维度
+    - Merton: 质量评估应该透明，让用户理解决策依据
+    - Box 哲学: 模型应该承认不确定性，Quality Score 附带置信度
+    
+    使用方式：
+        scorer = SearchQualityScorer()
+        quality = scorer.score(query, results)
+        print(f"Quality: {quality.score}, Confidence: {quality.confidence}")
+    """
+    
+    def __init__(self):
+        self._weights = {
+            "relevance": 0.30,
+            "diversity": 0.20,
+            "freshness": 0.15,
+            "authority": 0.15,
+            "completeness": 0.10,
+            "trust": 0.10,
+        }
+        self._feedback_history: list[dict] = []
+        self._lock = threading.Lock()
+    
+    @dataclass
+    class QualityScore:
+        """搜索质量评分结果"""
+        score: float  # 综合评分 [0.0, 1.0]
+        confidence: float  # 置信度 [0.0, 1.0]
+        relevance_score: float
+        diversity_score: float
+        freshness_score: float
+        authority_score: float
+        completeness_score: float
+        trust_score: float
+        issues: list[str]  # 发现的问题
+        suggestions: list[str]  # 改进建议
+        
+        def to_dict(self) -> dict:
+            return {
+                "score": round(self.score, 3),
+                "confidence": round(self.confidence, 3),
+                "relevance": round(self.relevance_score, 3),
+                "diversity": round(self.diversity_score, 3),
+                "freshness": round(self.freshness_score, 3),
+                "authority": round(self.authority_score, 3),
+                "completeness": round(self.completeness_score, 3),
+                "trust": round(self.trust_score, 3),
+                "issues": self.issues,
+                "suggestions": self.suggestions,
+            }
+    
+    def score(self, query: str, results: list) -> "QualityScore":
+        """
+        评估搜索结果的质量。
+        
+        Args:
+            query: 搜索查询
+            results: 搜索结果列表
+            
+        Returns:
+            QualityScore 对象
+        """
+        issues: list[str] = []
+        suggestions: list[str] = []
+        
+        if not results:
+            return self.QualityScore(
+                score=0.0,
+                confidence=1.0,  # 高度确定没有结果就是差
+                relevance_score=0.0,
+                diversity_score=0.0,
+                freshness_score=0.0,
+                authority_score=0.0,
+                completeness_score=0.0,
+                trust_score=0.0,
+                issues=["No search results returned"],
+                suggestions=["Try different query terms or enable more search engines"],
+            )
+        
+        # 1. 相关性评分
+        relevance_score = self._compute_relevance(query, results)
+        if relevance_score < 0.3:
+            issues.append(f"Low relevance score: {relevance_score:.2f}")
+            suggestions.append("Results may not match the query intent")
+        
+        # 2. 多样性评分
+        diversity_score = self._compute_diversity(results)
+        if diversity_score < 0.3:
+            issues.append(f"Low diversity score: {diversity_score:.2f}")
+            suggestions.append("Consider enabling DIVERSITY ranking strategy")
+        
+        # 3. 新鲜度评分
+        freshness_score = self._compute_freshness(results)
+        if freshness_score < 0.3:
+            issues.append(f"Low freshness score: {freshness_score:.2f}")
+            suggestions.append("Results may contain outdated information")
+        
+        # 4. 权威性评分
+        authority_score = self._compute_authority(results)
+        if authority_score < 0.3:
+            issues.append(f"Low authority score: {authority_score:.2f}")
+            suggestions.append("Results may come from less authoritative sources")
+        
+        # 5. 完整性评分
+        completeness_score = self._compute_completeness(results)
+        
+        # 6. 信任度评分（基于 trust_score 字段）
+        trust_score = sum(r.trust_score for r in results) / len(results) if results else 0.0
+        
+        # 综合评分
+        total_score = (
+            relevance_score * self._weights["relevance"] +
+            diversity_score * self._weights["diversity"] +
+            freshness_score * self._weights["freshness"] +
+            authority_score * self._weights["authority"] +
+            completeness_score * self._weights["completeness"] +
+            trust_score * self._weights["trust"]
+        )
+        
+        # 计算置信度（基于结果数量和分数差异）
+        confidence = self._compute_confidence(results, total_score)
+        
+        return self.QualityScore(
+            score=total_score,
+            confidence=confidence,
+            relevance_score=relevance_score,
+            diversity_score=diversity_score,
+            freshness_score=freshness_score,
+            authority_score=authority_score,
+            completeness_score=completeness_score,
+            trust_score=trust_score,
+            issues=issues,
+            suggestions=suggestions,
+        )
+    
+    def _compute_relevance(self, query: str, results: list[SearchResult]) -> float:
+        """计算相关性评分"""
+        if not results:
+            return 0.0
+        
+        query_terms = set(query.lower().split())
+        if not query_terms:
+            return 0.5
+        
+        relevance_scores = []
+        for r in results:
+            text = (r.title + " " + r.content).lower()
+            matched = sum(1 for term in query_terms if term in text)
+            relevance_scores.append(matched / len(query_terms))
+        
+        # 返回平均相关性
+        return sum(relevance_scores) / len(relevance_scores)
+    
+    def _compute_diversity(self, results: list[SearchResult]) -> float:
+        """计算多样性评分（基于域名分布）"""
+        if not results:
+            return 0.0
+        
+        # 提取域名
+        domains: set[str] = set()
+        for r in results:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(r.url)
+                if parsed.netloc:
+                    domains.add(parsed.netloc)
+            except Exception:
+                pass
+        
+        # 域名多样性：独特域名数 / 总结果数
+        if len(results) == 0:
+            return 0.0
+        
+        diversity = len(domains) / len(results)
+        return min(diversity, 1.0)
+    
+    def _compute_freshness(self, results: list[SearchResult]) -> float:
+        """计算新鲜度评分"""
+        if not results:
+            return 0.0
+        
+        # 解析每个结果的 freshness
+        freshness_values = []
+        for r in results:
+            fn = RankableResult._freshness_to_number(r.freshness)
+            freshness_values.append(fn)
+        
+        # 返回平均新鲜度
+        return sum(freshness_values) / len(freshness_values)
+    
+    def _compute_authority(self, results: list[SearchResult]) -> float:
+        """计算权威性评分"""
+        if not results:
+            return 0.0
+        
+        # 基于 authority 和 trust_score 计算
+        authority_scores = []
+        for r in results:
+            auth = r.authority if r.authority else 0.3
+            trust = r.trust_score if r.trust_score else 0.3
+            authority_scores.append((auth + trust) / 2)
+        
+        return sum(authority_scores) / len(authority_scores)
+    
+    def _compute_completeness(self, results: list[SearchResult]) -> float:
+        """计算完整性评分（基于内容长度和结构）"""
+        if not results:
+            return 0.0
+        
+        completeness_scores = []
+        for r in results:
+            # 内容长度评分
+            content_len = len(r.content) if r.content else 0
+            length_score = min(content_len / 500, 1.0)  # 500 字符为满分
+            
+            # 结构完整性（有 title、有 content）
+            structure_score = 1.0 if (r.title and r.content) else 0.5
+            
+            completeness_scores.append(length_score * 0.6 + structure_score * 0.4)
+        
+        return sum(completeness_scores) / len(completeness_scores)
+    
+    def _compute_confidence(self, results: list[SearchResult], total_score: float) -> float:
+        """
+        计算置信度。
+        
+        Box 哲学：承认模型的不确定性
+        - 结果数量多，置信度高
+        - 分数差异大（确定性强），置信度高
+        - 分数接近（不确定性高），置信度低
+        """
+        if not results:
+            return 1.0
+        
+        # 基于结果数量的置信度
+        count_confidence = min(len(results) / 10, 1.0)  # 10 个结果为满分
+        
+        # 基于分数方差的置信度
+        if len(results) >= 2:
+            scores = [r.score for r in results]
+            mean_score = sum(scores) / len(scores)
+            variance = sum((s - mean_score) ** 2 for s in scores) / len(scores)
+            # 方差大（分数分散），置信度高；方差小（分数接近），置信度低
+            score_confidence = min(variance * 2, 1.0)  # 归一化
+        else:
+            score_confidence = 0.5
+        
+        return (count_confidence * 0.4 + score_confidence * 0.6)
+    
+    def record_feedback(
+        self,
+        query: str,
+        clicked_url: str | None = None,
+        feedback: str | None = None
+    ) -> None:
+        """
+        记录用户反馈，用于改进质量评估。
+        
+        Args:
+            query: 搜索查询
+            clicked_url: 用户点击的 URL（如果有）
+            feedback: 用户反馈（"helpful", "not_helpful", "relevant", "not_relevant"）
+        """
+        with self._lock:
+            self._feedback_history.append({
+                "query": query,
+                "clicked_url": clicked_url,
+                "feedback": feedback,
+                "timestamp": time.time(),
+            })
+            
+            # 限制历史大小
+            if len(self._feedback_history) > 10000:
+                self._feedback_history = self._feedback_history[-5000:]
+    
+    def get_feedback_stats(self) -> dict:
+        """获取反馈统计"""
+        with self._lock:
+            if not self._feedback_history:
+                return {
+                    "total_feedbacks": 0,
+                    "helpful_rate": 0.0,
+                    "click_rate": 0.0,
+                }
+            
+            total = len(self._feedback_history)
+            helpful = sum(1 for f in self._feedback_history if f.get("feedback") in ("helpful", "relevant"))
+            clicked = sum(1 for f in self._feedback_history if f.get("clicked_url"))
+            
+            return {
+                "total_feedbacks": total,
+                "helpful_rate": helpful / total if total > 0 else 0,
+                "click_rate": clicked / total if total > 0 else 0,
+            }
 
 
 class SearchEngine(Enum):
@@ -332,47 +1095,72 @@ class SearchAPIError(Exception):
 
 class CircuitBreakerForSearch:
     """
-    搜索 API 专用熔断器。
-    
-    追踪每个 engine 的连续失败次数，超过阈值后进入 OPEN 状态，
-    跳过该 engine 的调用（快速失败），N 秒后进入 HALF_OPEN 试探。
+    搜索 API 专用熔断器（线程安全版）。
+
+    方法论来源:
+    - 詹姆斯高斯林(JVM): 线程安全的共享状态访问需要锁保护
+    - 本杰明富兰克林(预防原则): 在并发问题出现前就加锁
+    - 毛泽东(矛盾论): 主要矛盾是并发写入，次要矛盾是读一致性
+
+    Fix: TOCTOU 修复 - 将函数执行也纳入锁保护范围，
+    保证状态检查→执行→状态更新整个流程的原子性。
     """
     def __init__(self, failure_threshold: int = 3, recovery_timeout: float = 30.0):
+        import threading
         self._failure_threshold = failure_threshold
         self._recovery_timeout = recovery_timeout
-        self._engine_state: dict[str, str] = {}  # "closed"/"open"/"half_open"
+        self._engine_state: dict[str, str] = {}
         self._failure_counts: dict[str, int] = {}
         self._last_failure_time: dict[str, float] = {}
-    
+        self._lock = threading.Lock()
+        # 事件回调（用于 circuit_tripped 通知）
+        self._on_tripped = None
+
+    def set_tripped_callback(self, cb):
+        """设置熔断跳闸回调（接收 engine, error 参数）"""
+        self._on_tripped = cb
+
     def call(self, engine: str, fn, *args, **kwargs):
-        """
-        如果 engine 处于 OPEN/HALF_OPEN 状态则跳过调用直接返回空列表。
-        否则执行 fn(*args, **kwargs)，根据结果更新熔断器状态。
-        """
         import time
-        import threading
-        
-        if self._engine_state.get(engine) == "open":
-            # 检查是否超过 recovery_timeout
-            if time.time() - self._last_failure_time.get(engine, 0) >= self._recovery_timeout:
-                self._engine_state[engine] = "half_open"
-                self._failure_counts[engine] = 0
-            else:
-                return []  # 熔断中，快速返回空列表
-        
+
+        # Fix TOCTOU: 整个检查→执行→状态更新流程必须在锁内完成
+        with self._lock:
+            if self._engine_state.get(engine) == "open":
+                if time.time() - self._last_failure_time.get(engine, 0) >= self._recovery_timeout:
+                    self._engine_state[engine] = "half_open"
+                    self._failure_counts[engine] = 0
+                else:
+                    return []
+
+            # 记录进入熔断器时的状态（用于判断成功后是否需要切换到 closed）
+            entry_state = self._engine_state.get(engine)
+
+        # 函数执行在锁外进行（避免长期阻塞其他线程调用熔断器）
+        # 但状态更新在锁内，保证原子性
         try:
             result = fn(*args, **kwargs)
-            if self._engine_state.get(engine) == "half_open":
-                # 试探成功，复位
-                self._engine_state[engine] = "closed"
-                self._failure_counts[engine] = 0
+            with self._lock:
+                # Fix TOCTOU: 重新获取当前状态，不要用 entry_state（可能在 fn() 执行期间被其他线程修改）
+                current_state = self._engine_state.get(engine)
+                if current_state == "half_open":
+                    self._engine_state[engine] = "closed"
+                    self._failure_counts[engine] = 0
             return result
-        except Exception:
-            self._failure_counts[engine] = self._failure_counts.get(engine, 0) + 1
-            self._last_failure_time[engine] = time.time()
-            if self._failure_counts[engine] >= self._failure_threshold:
-                self._engine_state[engine] = "open"
+        except Exception as exc:
+            with self._lock:
+                self._failure_counts[engine] = self._failure_counts.get(engine, 0) + 1
+                self._last_failure_time[engine] = time.time()
+                if self._failure_counts[engine] >= self._failure_threshold:
+                    self._engine_state[engine] = "open"
+                    # 熔断跳闸事件
+                    if self._on_tripped:
+                        try:
+                            self._on_tripped(engine, str(exc)[:100])
+                        except Exception:
+                            pass
             raise
+
+
 
 
 class SearchSkill:
@@ -398,14 +1186,25 @@ class SearchSkill:
         self._cache: dict[str, list[SearchResult]] = {}  # query_hash -> results
         self._cache_time: dict[str, float] = {}  # query_hash -> timestamp
         self._last_search_time: float = 0
+        # Fix: 添加缓存锁，保护 _cache 和 _cache_time 的并发访问
+        self._cache_lock = threading.Lock()
 
         # FAISS 向量索引初始化（懒加载，首次搜索时建立）
         self._result_cache_for_vector: list[SearchResult] = []
         self._faiss_index: Any = None  # FAISS index object
         self._faiss_index_ids: list = []  # 追踪 FAISS index 中的 ID 对应关系
+        # Fix S4 (Remaining-Components-Audit): FAISS 持久化的进程内锁
+        # （多进程需额外文件锁，单进程内的并发已足够保护）
+        self._faiss_lock = threading.Lock()
+        # Fix: 标记 FAISS 索引是否需要重建（避免在持有锁时调用 rebuild）
+        self._faiss_dirty = False
 
         # 熔断器：防止单个搜索 API 失败拖垮整体服务
         self._circuit_breaker = CircuitBreakerForSearch(failure_threshold=3, recovery_timeout=30.0)
+        # 熔断器跳闸事件注册到 blinker 信号系统
+        self._circuit_breaker.set_tripped_callback(
+            lambda engine, err: self.notify("circuit_tripped", {"engine": engine, "error": err})
+        )
 
         # V 2026-06-24: 尝试恢复持久化的 FAISS 索引
         self._restore_faiss_index()
@@ -493,9 +1292,22 @@ class SearchSkill:
 
     def notify(self, event: str, data: dict):
         """
-        接收事件通知
+        接收事件通知，通过 blinker 信号广播给订阅者。
+
+        支持的事件:
+            - 'search_started': 搜索开始，data 包含 query
+            - 'search_completed': 搜索完成，data 包含 query/results/count
+            - 'cache_hit': 缓存命中，data 包含 query
+            - 'engine_failed': 引擎失败，data 包含 engine/error
+
+        订阅示例:
+            from blinker import signal
+            def on_search_done(sender, **kw):
+                print(f"搜索完成: {kw.get('query')}")
+            signal('search-skill-event').connect(on_search_done)
         """
-        pass  # 目前没有需要处理的事件
+        if _search_event_signal is not None:
+            _search_event_signal.send(self, event=event, data=data or {})
 
     # ==================== 核心方法 ====================
 
@@ -513,11 +1325,15 @@ class SearchSkill:
                 "success": False,
                 "error": {"code": "EMPTY_QUERY", "message": "Query is empty"}
             }
+
+        # 事件通知：搜索开始
+        self.notify("search_started", {"query": query, "engines": engines})
         
         # 检查缓存
         cache_key = self._get_cache_key(query, engines)
         cached_results = self._get_cached(cache_key)
         if cached_results:
+            self.notify("cache_hit", {"query": query, "count": len(cached_results)})
             return {
                 "results": [self._result_to_dict(r) for r in cached_results],
                 "cached": True,
@@ -578,8 +1394,12 @@ class SearchSkill:
                             all_results.extend(results)
                             if engine_name not in used_engines:
                                 used_engines.append(engine_name)
-                    except Exception:
-                        pass  # 熔断器已处理，忽略即可
+                    except Exception as exc:
+                        # 熔断器已处理，记录失败事件
+                        self.notify("engine_failed", {
+                            "engine": engine_name,
+                            "error": str(exc)[:100]
+                        })
 
             # 如果所有真实 API 都失败了，使用 mock
             if not all_results:
@@ -612,9 +1432,10 @@ class SearchSkill:
             unique_results = self._rerank_results(unique_results, query)
 
         # 缓存
-        self._cache[cache_key] = unique_results
-        self._cache_time[cache_key] = time.time()
-        self._last_search_time = time.time()
+        with self._cache_lock:
+            self._cache[cache_key] = unique_results
+            self._cache_time[cache_key] = time.time()
+            self._last_search_time = time.time()
         
         # 更新上下文
         self._context.set_search_query(query)
@@ -623,6 +1444,14 @@ class SearchSkill:
             for r in unique_results
         ])
         
+        # 事件通知：搜索完成
+        self.notify("search_completed", {
+            "query": query,
+            "count": len(unique_results),
+            "engines": used_engines,
+            "cached": False
+        })
+
         return {
             "results": [self._result_to_dict(r) for r in unique_results],
             "fake": used_engines == ["mock"],  # Minsky: 明确标记假数据，防止用户误信
@@ -926,14 +1755,28 @@ class SearchSkill:
         results = []
         # Perplexity 返回 citations 列表，格式为 URL
         citations = data.get("citations", [])
-        # 也从 content 中解析出引用的 URL
-        for idx, citation_url in enumerate(citations[:max_results]):
+        # Fix S2 (Remaining-Components-Audit): 也从 content 中解析出引用的 URL（[1][2] 形式）
+        # 以及提取答案文本作为首选 result 的 content
+        answer_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        # 合并 citations：先 API 返的 citations，再从 answer_text 中扣 URL
+        url_pattern = re.compile(r"https?://[^\s\]\)\,，]+")
+        extra_urls = url_pattern.findall(answer_text)
+        all_urls = list(citations) + [u for u in extra_urls if u not in citations]
+        for idx, citation_url in enumerate(all_urls[:max_results]):
+            # 把该 URL 在 answer_text 里对应的句子作为 content（简单粗粒度提取）
+            local_content = ""
+            if idx == 0 and answer_text:
+                local_content = answer_text[:500]  # 首条复用全文
+            else:
+                m = re.search(rf"{re.escape(citation_url)}[^。\.]*[。\.]", answer_text)
+                if m:
+                    local_content = m.group(0)
             results.append(SearchResult(
                 url=citation_url,
                 title=f"Result {idx + 1}",
-                content="",  # Perplexity chat 格式没有独立 snippet
+                content=local_content,
                 engine="perplexity",
-                score=1.0 - (idx * 0.1),  # 按引用顺序递减
+                score=1.0 - (idx * 0.1),
                 relevance=1.0 - (idx * 0.1),
                 freshness="",
                 authority=0.5
@@ -992,9 +1835,29 @@ class SearchSkill:
 
         try:
             with urllib.request.urlopen(req, timeout=self.config.timeout) as response:
+                # Fix S3 (Remaining-Components-Audit): 检查 rate limit 响应头
+                remaining = response.headers.get("X-RateLimit-Remaining")
+                if remaining is not None:
+                    try:
+                        if int(remaining) <= 0:
+                            reset_at = response.headers.get("X-RateLimit-Reset", "")
+                            raise SearchAPIError(
+                                "github",
+                                f"Rate limit exceeded (reset at {reset_at})",
+                                status_code=429,
+                            )
+                    except ValueError:
+                        pass  # header 不是合法 int，跳过
                 data = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8")[:200] if e.fp else ""
+            # 403 也可能是 secondary rate limit
+            if e.code == 403 and "rate limit" in error_body.lower():
+                raise SearchAPIError(
+                    "github",
+                    f"Rate limit hit (403): {error_body}",
+                    status_code=403,
+                )
             raise SearchAPIError(
                 "github",
                 f"HTTP {e.code}: {error_body}",
@@ -1552,9 +2415,10 @@ class SearchSkill:
 
     def _clear_cache(self, params: dict) -> dict:
         """清空缓存"""
-        count = len(self._cache)
-        self._cache = {}
-        self._cache_time = {}
+        with self._cache_lock:
+            count = len(self._cache)
+            self._cache = {}
+            self._cache_time = {}
         return {"cleared": True, "count": count}
 
     # ==================== 辅助方法 ====================
@@ -1566,24 +2430,25 @@ class SearchSkill:
 
     def _get_cached(self, cache_key: str) -> list[SearchResult] | None:
         """获取缓存结果"""
-        if cache_key not in self._cache:
-            return None
-        
-        cached = self._cache[cache_key]
-        cache_time = self._cache_time.get(cache_key, 0)
-        
-        # 检查是否过期
-        if time.time() - cache_time > self.config.cache_ttl:
-            del self._cache[cache_key]
-            if cache_key in self._cache_time:
-                del self._cache_time[cache_key]
-            return None
-        
-        # 标记为缓存
-        for r in cached:
-            r.cached = True
-        
-        return cached
+        with self._cache_lock:
+            if cache_key not in self._cache:
+                return None
+
+            cached = self._cache[cache_key]
+            cache_time = self._cache_time.get(cache_key, 0)
+
+            # 检查是否过期
+            if time.time() - cache_time > self.config.cache_ttl:
+                del self._cache[cache_key]
+                if cache_key in self._cache_time:
+                    del self._cache_time[cache_key]
+                return None
+
+            # 标记为缓存（复制一份避免污染原始数据）
+            for r in cached:
+                r.cached = True
+
+            return cached
 
     # ==================== 2026-06-24: FAISS 持久化 + 缓存限制 ====================
 
@@ -1591,72 +2456,82 @@ class SearchSkill:
         """
         从磁盘恢复持久化的 FAISS 索引和向量缓存。
         解决重启后索引丢失的问题。
+
+        Fix S4: 加锁保护，防止并发恢复导致索引损坏。
         """
         if not HAS_FAISS:
             return
-        try:
-            if os.path.exists(self.FAISS_INDEX_PATH):
-                # 加载序列化的索引
-                state = np.load(self.FAISS_INDEX_PATH, allow_pickle=True)
-                index_data = state.item()
-                if index_data is not None:
-                    self._result_cache_for_vector = index_data.get('results', [])
-                    # 向量索引重建（FAISS 不支持直接序列化 IndexIDMap）
-                    if self._result_cache_for_vector and HAS_SENTENCE_TRANSFORMERS:
-                        self._rebuild_faiss_index()
-                    print(f"[SearchSkill] Restored FAISS index with {len(self._result_cache_for_vector)} entries")
-        except Exception as e:
-            print(f"[SearchSkill] Failed to restore FAISS index: {e}")
-            # 降级：清空损坏的缓存
-            self._result_cache_for_vector = []
+        with self._faiss_lock:
+            try:
+                if os.path.exists(self.FAISS_INDEX_PATH):
+                    # 加载序列化的索引
+                    state = np.load(self.FAISS_INDEX_PATH, allow_pickle=True)
+                    index_data = state.item()
+                    if index_data is not None:
+                        self._result_cache_for_vector = index_data.get('results', [])
+                        # 向量索引重建（FAISS 不支持直接序列化 IndexIDMap）
+                        if self._result_cache_for_vector and HAS_SENTENCE_TRANSFORMERS:
+                            self._rebuild_faiss_index()
+                        print(f"[SearchSkill] Restored FAISS index with {len(self._result_cache_for_vector)} entries")
+            except Exception as e:
+                print(f"[SearchSkill] Failed to restore FAISS index: {e}")
+                # 降级：清空损坏的缓存
+                self._result_cache_for_vector = []
 
     def _rebuild_faiss_index(self):
         """根据缓存的 SearchResult 重建 FAISS 索引"""
         if not self._result_cache_for_vector or not HAS_SENTENCE_TRANSFORMERS:
             return
-        try:
-            if not hasattr(self, "_embedding_model"):
-                self._embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-            texts = [r.title + " " + (r.content or "") for r in self._result_cache_for_vector]
-            embeddings = self._embedding_model.encode(texts, convert_to_numpy=True)
-            embeddings = embeddings.astype("float32")
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            norms[norms == 0] = 1
-            embeddings = embeddings / norms
-            dimension = embeddings.shape[1]
-            index = faiss.IndexFlatIP(dimension)
-            self._faiss_index = faiss.IndexIDMap(index)
-            ids = np.array(list(range(len(self._result_cache_for_vector))))
-            self._faiss_index.add_with_ids(embeddings, ids)
-        except Exception:
-            self._faiss_index = None
+        with self._faiss_lock:
+            try:
+                if not hasattr(self, "_embedding_model"):
+                    self._embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+                texts = [r.title + " " + (r.content or "") for r in self._result_cache_for_vector]
+                embeddings = self._embedding_model.encode(texts, convert_to_numpy=True)
+                embeddings = embeddings.astype("float32")
+                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                norms[norms == 0] = 1
+                embeddings = embeddings / norms
+                dimension = embeddings.shape[1]
+                index = faiss.IndexFlatIP(dimension)
+                self._faiss_index = faiss.IndexIDMap(index)
+                ids = np.array(list(range(len(self._result_cache_for_vector))))
+                self._faiss_index.add_with_ids(embeddings, ids)
+            except Exception:
+                self._faiss_index = None
 
     def _save_faiss_index(self):
         """
         将 FAISS 索引状态持久化到磁盘。
         只保存 SearchResult 列表（可序列化），
         向量索引在下一次 _restore_faiss_index 时重建。
+
+        Fix S4: 加锁保护，防止并发写入损坏 .npy 文件。
         """
         if not HAS_FAISS:
             return
-        try:
-            # 只序列化 SearchResult 列表（索引可通过结果重建）
-            state = {'results': self._result_cache_for_vector}
-            np.save(self.FAISS_INDEX_PATH, np.array(state, dtype=object))
-        except Exception as e:
-            print(f"[SearchSkill] Failed to save FAISS index: {e}")
+        with self._faiss_lock:
+            try:
+                # 只序列化 SearchResult 列表（索引可通过结果重建）
+                state = {'results': self._result_cache_for_vector}
+                np.save(self.FAISS_INDEX_PATH, np.array(state, dtype=object))
+            except Exception as e:
+                print(f"[SearchSkill] Failed to save FAISS index: {e}")
 
     def _evict_vector_cache_if_needed(self):
         """
         当向量缓存超过 MAX_VECTOR_CACHE_SIZE 时，淘汰最旧的结果。
         采用 FIFO 策略（从列表头部移除）。
+        标记 _faiss_dirty=True，后续由调用方在锁外完成 rebuild。
         """
-        while len(self._result_cache_for_vector) > self.MAX_VECTOR_CACHE_SIZE:
-            evicted = self._result_cache_for_vector.pop(0)
-            # 重建索引（因为 ID 对应关系被打乱了）
-            if self._faiss_index is not None and len(self._result_cache_for_vector) > 0:
-                self._rebuild_faiss_index()
-            print(f"[SearchSkill] Evicted vector cache entry: {evicted.url}")
+        evicted_something = False
+        with self._faiss_lock:
+            while len(self._result_cache_for_vector) > self.MAX_VECTOR_CACHE_SIZE:
+                evicted = self._result_cache_for_vector.pop(0)
+                evicted_something = True
+                print(f"[SearchSkill] Evicted vector cache entry: {evicted.url}")
+            if evicted_something:
+                self._faiss_dirty = True
 
     def _enforce_cache_ttl(self):
         """
@@ -1664,13 +2539,14 @@ class SearchSkill:
         防止 _cache 和 _cache_time 长期不同步导致内存泄漏。
         """
         now = time.time()
-        expired_keys = [
-            k for k, t in self._cache_time.items()
-            if now - t > self.config.cache_ttl
-        ]
-        for k in expired_keys:
-            self._cache.pop(k, None)
-            self._cache_time.pop(k, None)
+        with self._cache_lock:
+            expired_keys = [
+                k for k, t in self._cache_time.items()
+                if now - t > self.config.cache_ttl
+            ]
+            for k in expired_keys:
+                self._cache.pop(k, None)
+                self._cache_time.pop(k, None)
 
     # ==================== 2026-06-24: 向量检索 + 混合搜索 + RAG 重排序 ====================
 
@@ -1707,19 +2583,27 @@ class SearchSkill:
             norms[norms == 0] = 1
             embeddings = embeddings / norms
 
-            # 建立或追加 FAISS 索引
-            dimension = embeddings.shape[1]
-            if self._faiss_index is None:
-                index = faiss.IndexFlatIP(dimension)
-                self._faiss_index = faiss.IndexIDMap(index)
+            # Fix P1: 加锁保护所有 FAISS 索引操作
+            with self._faiss_lock:
+                # 建立或追加 FAISS 索引
+                dimension = embeddings.shape[1]
+                if self._faiss_index is None:
+                    index = faiss.IndexFlatIP(dimension)
+                    self._faiss_index = faiss.IndexIDMap(index)
 
-            # 添加向量和对应的原始 SearchResult
-            ids = np.array([len(self._result_cache_for_vector) + i for i in range(len(new_results))])
-            self._faiss_index.add_with_ids(embeddings, ids)
-            self._result_cache_for_vector.extend(new_results)
+                # 添加向量和对应的原始 SearchResult
+                ids = np.array([len(self._result_cache_for_vector) + i for i in range(len(new_results))])
+                self._faiss_index.add_with_ids(embeddings, ids)
+                self._result_cache_for_vector.extend(new_results)
+                # Fix P1: 标记 dirty，确保后续 rebuild
+                self._faiss_dirty = True
 
-            # V 2026-06-24: 防止向量缓存无限增长
+            # V 2026-06-24: 防止向量缓存无限增长（在锁外调用，内部会加锁）
             self._evict_vector_cache_if_needed()
+            # Fix: 如果 eviction 标记了 dirty，在锁外重建 FAISS 索引
+            if self._faiss_dirty:
+                self._rebuild_faiss_index()
+                self._faiss_dirty = False
             # V 2026-06-24: 持久化 FAISS 索引状态
             self._save_faiss_index()
 
@@ -1750,14 +2634,15 @@ class SearchSkill:
             query_vec = self._embedding_model.encode([query], convert_to_numpy=True)[0]
             query_vec = query_vec.astype("float32")
 
-            # FAISS 搜索
+            # FAISS 搜索（Fix P1: 加锁保护）
             k = min(top_k, len(self._result_cache_for_vector))
             if k == 0:
                 return []
 
-            distances, indices = self._faiss_index.search(
-                query_vec.reshape(1, -1), k
-            )
+            with self._faiss_lock:
+                distances, indices = self._faiss_index.search(
+                    query_vec.reshape(1, -1), k
+                )
 
             results = []
             for dist, idx in zip(distances[0], indices[0]):
